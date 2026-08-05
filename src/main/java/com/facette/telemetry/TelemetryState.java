@@ -58,6 +58,12 @@ final class TelemetryState
 
 	private static final String UNKNOWN_GAME_STATE = "UNKNOWN";
 
+	/**
+	 * RuneLite's aggregate-experience sentinel, which is not a real trainable skill. Compared
+	 * lowercase, matching how skill names are normalized here.
+	 */
+	private static final String OVERALL_SKILL_NAME = "overall";
+
 	private final String instanceId;
 	private final LongSupplier clock;
 
@@ -214,6 +220,52 @@ final class TelemetryState
 		markIfChanged(freeSlots, free);
 		usedSlots = used;
 		freeSlots = free;
+	}
+
+	/**
+	 * Establishes a skill's comparison baseline from the client's current total, without
+	 * treating it as an observation.
+	 *
+	 * <p>This exists because the plugin can be enabled while the player is already logged in.
+	 * The login-time experience events have long since fired, so nothing has filled the
+	 * baselines, and the next real gain would otherwise be consumed by
+	 * {@link #observeXp(String, int)}'s first-observation rule and never exported. Seeding
+	 * from the live totals means that gain is measured against the truth instead.
+	 *
+	 * <p>Deliberately separate from {@code observeXp} rather than reusing it: this is not an
+	 * event, it can never report a gain, and it must never move a baseline that already
+	 * exists. Sharing one method would make the caller's intent — and those invariants —
+	 * depend on which branch happened to be taken.
+	 *
+	 * <p>Unlike {@code observeXp}, this rejects the {@code OVERALL} sentinel, because the
+	 * caller enumerates skills programmatically and a non-real entry could appear in that
+	 * enumeration; experience events, by contrast, always carry a real skill.
+	 *
+	 * @param totalXp the client's current total for the skill; zero is legitimate for an
+	 *                untrained skill and is seeded, while a negative total is refused
+	 * @return true when this call established a new baseline
+	 */
+	synchronized boolean seedXpBaseline(String skillName, int totalXp)
+	{
+		if (!loggedIn || skillName == null || totalXp < 0)
+		{
+			return false;
+		}
+		String skill = skillName.toLowerCase(Locale.ROOT);
+		if (OVERALL_SKILL_NAME.equals(skill))
+		{
+			return false;
+		}
+		// Never lowers or replaces: a baseline already established by a real observation, or
+		// by an earlier seed, is the more trustworthy one.
+		if (xpBaselines.containsKey(skill))
+		{
+			return false;
+		}
+		xpBaselines.put(skill, totalXp);
+		// Deliberately not marked dirty. Seeding changes nothing that is exported, so it must
+		// not by itself cause a publication or advance the sequence.
+		return true;
 	}
 
 	/**

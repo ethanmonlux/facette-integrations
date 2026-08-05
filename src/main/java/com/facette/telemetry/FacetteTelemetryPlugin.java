@@ -118,7 +118,16 @@ public class FacetteTelemetryPlugin extends Plugin
 			new TelemetrySnapshotWriter(dataDirectory()));
 		currentRun = run;
 
-		sampleClientState();
+		// Ordering matters, and all of it happens on the client thread before the publisher
+		// exists. The run and its state are created first; sampling then records whether this
+		// is a live session; seeding fills the experience baselines only if it is. Because the
+		// executor is not started until after all of that, no publication can observe a
+		// half-initialized run, and none of these client calls happens under the publication
+		// lock — nothing here can block the client thread on the publisher.
+		if (sampleClientState())
+		{
+			seedXpBaselines(run.getState());
+		}
 
 		executor = Executors.newSingleThreadScheduledExecutor(runnable ->
 		{
@@ -267,13 +276,16 @@ public class FacetteTelemetryPlugin extends Plugin
 	/**
 	 * Reads the approved client state. Called from the client thread only, so the values
 	 * are consistent with the tick that produced them.
+	 *
+	 * @return true when the client is in a live logged-in session, so callers needing that
+	 *         condition reuse this one definition rather than restating it
 	 */
-	private void sampleClientState()
+	private boolean sampleClientState()
 	{
 		TelemetryState state = currentState();
 		if (state == null)
 		{
-			return;
+			return false;
 		}
 
 		GameState gameState = client.getGameState();
@@ -281,7 +293,7 @@ public class FacetteTelemetryPlugin extends Plugin
 		state.updateSession(gameState.name(), loggedIn);
 		if (!loggedIn)
 		{
-			return;
+			return false;
 		}
 
 		state.updateWorld(client.getWorld());
@@ -298,6 +310,50 @@ public class FacetteTelemetryPlugin extends Plugin
 			// Occupied slots, not total item quantity.
 			state.updateInventory(inventory.count());
 		}
+		return true;
+	}
+
+	/**
+	 * Seeds the experience baselines from the client's current totals, for the case where the
+	 * plugin is enabled while the player is already logged in.
+	 *
+	 * <p>In that case RuneLite's login-time experience events fired before the plugin was
+	 * running, so nothing has filled the baselines and the next real gain would be consumed
+	 * as a first observation and never exported. Seeding costs one read per skill, once per
+	 * start, and reports nothing.
+	 *
+	 * <p>Only called when {@link #sampleClientState()} reports a live session, so the totals
+	 * read here belong to a real logged-in character rather than an empty or half-loaded one.
+	 */
+	private void seedXpBaselines(TelemetryState state)
+	{
+		for (Skill skill : Skill.values())
+		{
+			if (!isSeedableSkill(skill))
+			{
+				continue;
+			}
+			// Read per skill rather than through getSkillExperiences(), whose array would have
+			// to be mapped back by ordinal — the kind of positional assumption that breaks
+			// silently when the enum changes.
+			state.seedXpBaseline(skill.name(), client.getSkillExperience(skill));
+		}
+	}
+
+	/**
+	 * Whether a skill enumeration entry is a real trainable skill the client will accept.
+	 *
+	 * <p>In current RuneLite {@code Skill.OVERALL} is a deprecated {@code null} constant
+	 * declared after the enum body, so it never appears in {@link Skill#values()} and this
+	 * filter is a no-op. It is written anyway because older RuneLite releases did expose
+	 * {@code OVERALL} as a real enum constant, the plugin builds against
+	 * {@code latest.release}, and the cost of being wrong is passing a non-skill — or a
+	 * null — to {@code getSkillExperience}. The check is on the entry itself and its name,
+	 * not on ordinal position or array length.
+	 */
+	private static boolean isSeedableSkill(Skill skill)
+	{
+		return skill != null && !"OVERALL".equals(skill.name());
 	}
 
 	/**

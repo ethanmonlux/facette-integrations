@@ -314,6 +314,199 @@ public class TelemetryStateTest
 		assertEquals("30", value(state.nextSnapshot(true).toJson(), "lastDelta"));
 	}
 
+	// --- startup baseline seeding (FACETTE-OSRS-PLUGIN-003) ---
+
+	/**
+	 * The defect this fixes: enabling the plugin mid-session left the baselines empty, so the
+	 * next real gain was consumed as a first observation and never exported.
+	 */
+	@Test
+	public void seedingMidSessionMakesTheNextGainReportable()
+	{
+		logIn();
+		assertTrue("seeding establishes a baseline", state.seedXpBaseline("WOODCUTTING", 1_234_567));
+
+		// Seeding itself reports nothing.
+		String afterSeed = state.nextSnapshot(true).toJson();
+		assertEquals("null", value(afterSeed, "lastSkill"));
+		assertEquals("null", value(afterSeed, "lastDelta"));
+		assertEquals("null", value(afterSeed, "lastChangedAt"));
+
+		// The very first gain after enabling is now exported, measured from the seeded total.
+		now = 1_770_000_005_000L;
+		assertTrue(state.observeXp("WOODCUTTING", 1_234_632));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("\"woodcutting\"", value(json, "lastSkill"));
+		assertEquals("65", value(json, "lastDelta"));
+		assertEquals("1770000005000", value(json, "lastChangedAt"));
+	}
+
+	@Test
+	public void withoutSeedingTheFirstGainIsStillConsumedAsTheBaseline()
+	{
+		// Pins the unseeded behavior the fix works around, so the contrast is explicit and a
+		// regression in either direction is visible.
+		logIn();
+		assertFalse(state.observeXp("WOODCUTTING", 1_234_632));
+		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
+	}
+
+	@Test
+	public void seedingNeverOverwritesAnExistingBaseline()
+	{
+		logIn();
+		state.observeXp("MINING", 5_000);
+
+		// A later seed must not move a baseline a real observation already established, in
+		// either direction.
+		assertFalse("seeding must not replace an existing baseline", state.seedXpBaseline("MINING", 1));
+		assertFalse(state.seedXpBaseline("MINING", 9_999_999));
+
+		assertTrue("the original baseline still governs", state.observeXp("MINING", 5_040));
+		assertEquals("40", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void seedingIsIdempotentForTheSameSkill()
+	{
+		logIn();
+		assertTrue(state.seedXpBaseline("FISHING", 400));
+		assertFalse("a second seed does nothing", state.seedXpBaseline("FISHING", 400));
+		assertFalse(state.seedXpBaseline("FISHING", 100));
+
+		assertTrue(state.observeXp("FISHING", 430));
+		assertEquals("30", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void zeroIsSeededBecauseAnUntrainedSkillLegitimatelyHasNone()
+	{
+		logIn();
+		assertTrue("zero is a real total for an untrained skill", state.seedXpBaseline("SAILING", 0));
+		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
+
+		// And the first experience in that skill is then reported in full.
+		assertTrue(state.observeXp("SAILING", 120));
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("\"sailing\"", value(json, "lastSkill"));
+		assertEquals("120", value(json, "lastDelta"));
+	}
+
+	@Test
+	public void aNegativeTotalIsNeverSeeded()
+	{
+		logIn();
+		assertFalse(state.seedXpBaseline("MINING", -1));
+
+		// Nothing was recorded, so the next reading still behaves as a first observation
+		// rather than reporting a gain measured from a nonsense baseline.
+		assertFalse(state.observeXp("MINING", 500));
+		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
+	}
+
+	@Test
+	public void seededBaselinesAreStillProtectedFromTransientLowReadings()
+	{
+		logIn();
+		state.seedXpBaseline("WOODCUTTING", 1_234_567);
+
+		// The round-4 protection must apply to seeded baselines exactly as to observed ones.
+		assertFalse(state.observeXp("WOODCUTTING", 0));
+		assertFalse("returning to the seeded total is not a gain",
+			state.observeXp("WOODCUTTING", 1_234_567));
+		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
+
+		assertTrue(state.observeXp("WOODCUTTING", 1_234_632));
+		assertEquals("65", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void nothingIsSeededWhileLoggedOut()
+	{
+		state.updateSession("LOGIN_SCREEN", false);
+		assertFalse(state.seedXpBaseline("WOODCUTTING", 1_234_567));
+
+		// Confirmed by behavior, not just the return value: after logging in, the first
+		// reading is still a first observation because no baseline was stored.
+		logIn();
+		assertFalse(state.observeXp("WOODCUTTING", 1_234_567));
+	}
+
+	@Test
+	public void invalidAndSentinelSkillEntriesAreSkipped()
+	{
+		logIn();
+		assertFalse("a null skill name is refused", state.seedXpBaseline(null, 100));
+		assertFalse("the OVERALL sentinel is refused", state.seedXpBaseline("OVERALL", 12_345_678));
+		assertFalse("case does not matter", state.seedXpBaseline("overall", 12_345_678));
+
+		// No baseline was stored under any of them.
+		assertFalse(state.observeXp("OVERALL", 12_345_678));
+		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
+	}
+
+	@Test
+	public void endingASessionClearsSeededBaselines()
+	{
+		logIn();
+		state.seedXpBaseline("FISHING", 10_000);
+
+		state.updateSession("LOGIN_SCREEN", false, true);
+		logIn();
+
+		// A seeded baseline must not survive a session end any more than an observed one.
+		assertFalse("the next login re-seeds rather than inheriting", state.observeXp("FISHING", 50_000));
+		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
+	}
+
+	@Test
+	public void aWorldHopPreservesSeededBaselines()
+	{
+		logIn();
+		state.seedXpBaseline("FISHING", 10_000);
+
+		state.updateSession("HOPPING", false, false);
+		logIn();
+
+		// The hop keeps the session, so the first gain after it is still reported.
+		assertTrue("a hop must not swallow the next gain", state.observeXp("FISHING", 10_040));
+		assertEquals("40", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void aFreshRunReseedsAndReportsTheNextGainCorrectly()
+	{
+		// Disable/re-enable while logged in: the plugin builds a new TelemetryState, so the
+		// new run starts with no baselines and seeds from the client's current totals.
+		logIn();
+		state.seedXpBaseline("COOKING", 800);
+		state.observeXp("COOKING", 850);
+
+		TelemetryState reEnabled = new TelemetryState(INSTANCE_ID, () -> now);
+		reEnabled.updateSession("LOGGED_IN", true);
+		assertEquals("a fresh run starts at sequence zero", 0L, reEnabled.getNextSeq());
+
+		assertTrue(reEnabled.seedXpBaseline("COOKING", 850));
+		assertTrue("the first gain after re-enabling is reported",
+			reEnabled.observeXp("COOKING", 875));
+		assertEquals("25", value(reEnabled.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void seedingDoesNotByItselfMakeAPublicationDue()
+	{
+		logIn();
+		state.nextSnapshot(true);
+		state.recordPublished();
+		assertFalse(state.isDirty());
+
+		// Baselines are not exported, so seeding must not trigger a publication.
+		assertTrue(state.seedXpBaseline("HERBLORE", 1_000));
+		assertFalse("seeding changes nothing exported", state.isDirty());
+		assertFalse(state.isPublicationDue(1_500L));
+	}
+
 	@Test
 	public void experienceIsNotObservedWhileLoggedOut()
 	{
