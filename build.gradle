@@ -23,6 +23,10 @@ dependencies {
 	annotationProcessor 'org.projectlombok:lombok:1.18.30'
 
 	testImplementation 'junit:junit:4.12'
+	// Test-only. Matches the coordinate the upstream RuneLite repository uses for its own
+	// client and plugin tests, so nothing new is introduced to the ecosystem this builds on.
+	// Never a production dependency: no main source references it and it is not packaged.
+	testImplementation 'org.mockito:mockito-core:3.1.0'
 	testImplementation group: 'net.runelite', name:'client', version: runeLiteVersion
 	testImplementation group: 'net.runelite', name:'jshell', version: runeLiteVersion
 }

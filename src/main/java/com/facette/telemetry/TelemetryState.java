@@ -28,6 +28,7 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
 /**
@@ -65,23 +66,93 @@ final class TelemetryState
 	private static final String OVERALL_SKILL_NAME = "overall";
 
 	private final String instanceId;
-	private final LongSupplier clock;
+
+	/**
+	 * Wall-clock milliseconds. The only source for values that leave this process as
+	 * timestamps — {@code emittedAt} and the experience {@code lastChangedAt}. Never used to
+	 * measure an interval, because it can jump in either direction.
+	 */
+	private final LongSupplier wallClockMillis;
+
+	/**
+	 * Monotonic elapsed nanoseconds. The only source for interval decisions. Its absolute
+	 * value is meaningless and is never exported; only differences between two readings mean
+	 * anything, and those differences are unaffected by any adjustment to wall time.
+	 */
+	private final LongSupplier elapsedNanos;
 
 	/** Session-local total-experience baselines, keyed by lowercase skill name. */
 	private final Map<String, Integer> xpBaselines = new HashMap<>();
 
 	/**
-	 * Earliest total experience seen per skill while the run was still starting, keyed by
-	 * lowercase skill name and emptied once initialization completes.
+	 * Experience evidence retained per skill while the run was still starting, keyed by
+	 * lowercase skill name.
 	 *
 	 * <p>Startup is deferred onto the client thread, so experience events can arrive before
-	 * any baseline exists. Their totals are held here rather than dropped, because seeding
-	 * afterwards from the live totals would silently absorb every gain that landed in that
-	 * window — and the window is as long as the client takes to drain its queue, not a fixed
-	 * tick. One entry per skill, first writer wins, so the map is bounded by the number of
-	 * skills no matter how long startup stays queued.
+	 * any baseline exists. They are held here rather than dropped, because seeding afterwards
+	 * from the live totals would silently absorb every gain that landed in that window — and
+	 * the window is as long as the client takes to drain its queue, not a fixed tick. One
+	 * aggregate entry per skill, so the map is bounded by the number of skills no matter how
+	 * long startup stays queued or how many events arrive.
 	 */
-	private final Map<String, Integer> preInitialXp = new HashMap<>();
+	private final Map<String, RetainedXp> preInitialXp = new HashMap<>();
+
+	/**
+	 * The experience evidence one skill accumulated before the run finished initializing,
+	 * reduced to the three values a measurable delta needs and nothing else.
+	 *
+	 * <p>Deliberately not an event list. Retaining events would grow without bound while
+	 * startup stayed queued, and nothing downstream can use more than the span's endpoints.
+	 * The earliest total is the low endpoint, the latest increasing total is the high one, and
+	 * the latest increasing event's wall time is when the span last advanced — which is what
+	 * the exported delta is stamped with.
+	 *
+	 * <p>The two totals move under different rules on purpose: the earliest is fixed by the
+	 * first observation and never moves again, while the latest tracks each strict increase.
+	 * Collapsing them into one first-writer-wins pair would stamp a multi-event span with its
+	 * first event's time, which is the defect this type exists to prevent.
+	 */
+	private static final class RetainedXp
+	{
+		/** Total at the first observation. Fixed for the life of the entry. */
+		private final int earliestTotal;
+
+		/** Total at the most recent strictly increasing observation. */
+		private int latestTotal;
+
+		/** Wall-clock time of the observation that last advanced {@link #latestTotal}. */
+		private long latestEventAtMillis;
+
+		private RetainedXp(int total, long atMillis)
+		{
+			this.earliestTotal = total;
+			this.latestTotal = total;
+			this.latestEventAtMillis = atMillis;
+		}
+
+		/**
+		 * Applies a later observation.
+		 *
+		 * <p>Only a strict increase moves anything. An equal or lower total is ignored
+		 * entirely — it does not lower a total, and it does not move the timestamp, because a
+		 * dip or a transient reading is not an event the exported delta represents.
+		 */
+		private void observe(int total, long atMillis)
+		{
+			if (total <= latestTotal)
+			{
+				return;
+			}
+			latestTotal = total;
+			latestEventAtMillis = atMillis;
+		}
+
+		/** Whether two distinct increasing totals bound a span that can actually be measured. */
+		private boolean hasMeasurableSpan()
+		{
+			return latestTotal > earliestTotal;
+		}
+	}
 
 	/**
 	 * Whether this session's experience baselines have been established from the client's live
@@ -99,7 +170,14 @@ final class TelemetryState
 	private long pendingVersion;
 
 	private long nextSeq;
-	private long lastPublishAtMillis;
+
+	/**
+	 * Monotonic elapsed reading at the last publication that actually reached the file. Not a
+	 * timestamp and never exported — only its difference from a later reading is meaningful.
+	 * A refused or failed publication leaves it alone, so a heartbeat is measured from the
+	 * last snapshot a reader could genuinely have seen.
+	 */
+	private long lastPublishAtElapsedNanos;
 
 	private String gameState = UNKNOWN_GAME_STATE;
 	private boolean loggedIn;
@@ -118,10 +196,22 @@ final class TelemetryState
 	private Integer lastDelta;
 	private Long lastChangedAt;
 
-	TelemetryState(String instanceId, LongSupplier clock)
+	/**
+	 * @param wallClockMillis wall-clock milliseconds, for exported timestamps only
+	 * @param elapsedNanos    monotonic elapsed nanoseconds, for interval decisions only. Kept
+	 *                        separate from the wall clock rather than derived from it, because
+	 *                        an interval measured against wall time stops elapsing when wall
+	 *                        time is adjusted backwards
+	 */
+	TelemetryState(String instanceId, LongSupplier wallClockMillis, LongSupplier elapsedNanos)
 	{
 		this.instanceId = Objects.requireNonNull(instanceId, "instanceId");
-		this.clock = Objects.requireNonNull(clock, "clock");
+		this.wallClockMillis = Objects.requireNonNull(wallClockMillis, "wallClockMillis");
+		this.elapsedNanos = Objects.requireNonNull(elapsedNanos, "elapsedNanos");
+		// Anchored at construction rather than left at zero. Elapsed readings carry no
+		// meaningful origin — System.nanoTime may legitimately start negative — so measuring
+		// the first interval from zero would compare against an arbitrary point.
+		this.lastPublishAtElapsedNanos = elapsedNanos.getAsLong();
 	}
 
 	String getInstanceId()
@@ -287,9 +377,9 @@ final class TelemetryState
 		{
 			return false;
 		}
-		// Consumed whether or not it is used, so a total held for a skill that already has a
+		// Consumed whether or not it is used, so evidence held for a skill that already has a
 		// baseline cannot survive to influence anything later.
-		Integer earliest = preInitialXp.remove(skill);
+		RetainedXp retained = preInitialXp.remove(skill);
 		// Never lowers or replaces: a baseline already established by a real observation, or
 		// by an earlier seed, is the more trustworthy one.
 		if (xpBaselines.containsKey(skill))
@@ -297,22 +387,39 @@ final class TelemetryState
 			return false;
 		}
 
-		if (earliest == null || earliest >= totalXp)
+		// The baseline always ends at the trusted live total, whatever the retained evidence
+		// said. That is the value later observations must be measured against.
+		xpBaselines.put(skill, totalXp);
+
+		if (retained == null || !retained.hasMeasurableSpan())
 		{
-			xpBaselines.put(skill, totalXp);
-			// Deliberately not marked dirty. Seeding alone changes nothing that is exported, so
-			// it must not by itself cause a publication or advance the sequence.
+			// Either nothing arrived while starting, or exactly one observation did. A single
+			// observation reports the total *after* whichever gain produced it, and the total
+			// before that gain is not knowable — experience events carry a running total, not a
+			// delta, and the client cannot be read from a thread this run has not reached. So
+			// the first gain is unmeasurable and is left unreported rather than invented.
+			//
+			// Deliberately not marked dirty: seeding alone changes nothing that is exported.
 			return true;
 		}
 
-		// Experience arrived while startup was still queued. The earliest total seen is the
-		// closest thing to a pre-gain baseline this run will ever have, so the measurable part
-		// of that experience is reported rather than buried. The baseline still advances to the
-		// live total, exactly as an ordinary observation would leave it.
-		xpBaselines.put(skill, totalXp);
+		if (retained.latestTotal > totalXp)
+		{
+			// Retained evidence sits above the total the client now reports, so the two
+			// disagree. Reporting a span measured against evidence the live client contradicts
+			// would be fabricating a gain out of an inconsistency. The baseline above still
+			// holds; nothing is exported.
+			return true;
+		}
+
+		// A span bounded by two increasing observations, consistent with the live total. Only
+		// the retained span is reported: any experience between the last retained event and
+		// this seed has no event of its own, and stretching the delta to cover it would mean
+		// stamping that portion with a time no event happened at. The baseline already sits at
+		// the live total, so nothing measured here is counted twice later.
 		lastSkill = skill;
-		lastDelta = totalXp - earliest;
-		lastChangedAt = clock.getAsLong();
+		lastDelta = retained.latestTotal - retained.earliestTotal;
+		lastChangedAt = retained.latestEventAtMillis;
 		markDirty();
 		return true;
 	}
@@ -324,16 +431,17 @@ final class TelemetryState
 	 * been sampled yet, so the session is not yet known to be live, and refusing on that basis
 	 * would discard exactly the events this exists to keep.
 	 *
-	 * <p>Only the first total per skill is kept. A later one is not more useful — the baseline
-	 * wanted is the earliest — and ignoring it is what bounds the map at one entry per skill.
+	 * <p>One aggregate entry per skill, updated in place. The first observation fixes the
+	 * earliest total and can never report a gain by itself, for the reason given in
+	 * {@link #seedXpBaseline(String, int)}. Each later strict increase extends the span and
+	 * moves its event time, so the delta eventually exported is stamped with the event that
+	 * last contributed to it rather than with whenever seeding happened to run. An equal or
+	 * lower total moves neither.
 	 *
-	 * <p>This can never report a gain by itself. The total it holds is already the total
-	 * <em>after</em> whichever gain prompted the event, and the total before it is not
-	 * knowable: experience events carry a running total, not a delta, and reading the client
-	 * requires the client thread this run has not reached yet. So the first gain per skill
-	 * inside the startup window is unmeasurable by construction; every later one is preserved.
+	 * <p>The time recorded is wall-clock, read when the event is received, because it is
+	 * exported as a timestamp. It is not elapsed time.
 	 *
-	 * @return true when this call retained a total for a skill that had none
+	 * @return true when this call created the entry for a skill that had none
 	 */
 	synchronized boolean recordPreInitialXp(String skillName, int totalXp)
 	{
@@ -346,7 +454,15 @@ final class TelemetryState
 		{
 			return false;
 		}
-		return preInitialXp.putIfAbsent(skill, totalXp) == null;
+		long atMillis = wallClockMillis.getAsLong();
+		RetainedXp existing = preInitialXp.get(skill);
+		if (existing == null)
+		{
+			preInitialXp.put(skill, new RetainedXp(totalXp, atMillis));
+			return true;
+		}
+		existing.observe(totalXp, atMillis);
+		return false;
 	}
 
 	/**
@@ -430,7 +546,7 @@ final class TelemetryState
 
 		lastSkill = skill;
 		lastDelta = totalXp - previous;
-		lastChangedAt = clock.getAsLong();
+		lastChangedAt = wallClockMillis.getAsLong();
 		markDirty();
 		return true;
 	}
@@ -439,10 +555,30 @@ final class TelemetryState
 	 * Whether a publication is due: either the state changed, or the last publication is old
 	 * enough that a reader needs a fresh heartbeat to distinguish a live plugin from a stale
 	 * file.
+	 *
+	 * <p>The interval is measured against monotonic elapsed time, never the wall clock.
+	 * Measured against wall time, an adjustment backwards — an NTP correction, a manual
+	 * change, a resume from sleep — makes the elapsed figure negative and keeps it negative
+	 * until wall time catches back up, so a perfectly healthy idle plugin stops heartbeating
+	 * and its file reads as stale for the size of the jump. Elapsed time cannot move
+	 * backwards, so no clock adjustment in either direction can suppress a heartbeat or
+	 * trigger one early.
+	 *
+	 * <p>The comparison is written as a subtraction of two elapsed readings so that it stays
+	 * correct across the wraparound {@code System.nanoTime} is permitted to have: the
+	 * difference remains accurate even when the raw readings straddle the numeric limit.
 	 */
 	synchronized boolean isPublicationDue(long heartbeatIntervalMillis)
 	{
-		return dirty || clock.getAsLong() - lastPublishAtMillis >= heartbeatIntervalMillis;
+		if (dirty)
+		{
+			// A change always publishes immediately; no interval is consulted at all.
+			return true;
+		}
+		// Saturating rather than overflowing: an absurd interval yields an unreachable
+		// threshold instead of a wrapped negative one that would make everything due.
+		long heartbeatIntervalNanos = TimeUnit.MILLISECONDS.toNanos(heartbeatIntervalMillis);
+		return elapsedNanos.getAsLong() - lastPublishAtElapsedNanos >= heartbeatIntervalNanos;
 	}
 
 	/**
@@ -462,7 +598,7 @@ final class TelemetryState
 		TelemetrySnapshot.Builder b = TelemetrySnapshot.builder()
 			.instanceId(instanceId)
 			.seq(nextSeq)
-			.emittedAt(clock.getAsLong())
+			.emittedAt(wallClockMillis.getAsLong())
 			.pluginActive(pluginActive)
 			.gameState(gameState)
 			.loggedIn(live);
@@ -500,7 +636,7 @@ final class TelemetryState
 	synchronized void recordPublished()
 	{
 		nextSeq++;
-		lastPublishAtMillis = clock.getAsLong();
+		lastPublishAtElapsedNanos = elapsedNanos.getAsLong();
 		if (version == pendingVersion)
 		{
 			dirty = false;

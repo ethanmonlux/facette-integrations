@@ -84,7 +84,7 @@ public class PublisherRunContextTest
 		Path directory = folder.getRoot().toPath().resolve("run-" + directoryCounter++);
 		return PublisherRunContext.begin(
 			newestGeneration,
-			new TelemetryState(UUID.randomUUID().toString(), clock),
+			new TelemetryState(UUID.randomUUID().toString(), clock, System::nanoTime),
 			new TelemetrySnapshotWriter(directory));
 	}
 
@@ -602,7 +602,7 @@ public class PublisherRunContextTest
 		{
 			return PublisherRunContext.begin(
 				newestGeneration,
-				new TelemetryState(UUID.randomUUID().toString(), clock),
+				new TelemetryState(UUID.randomUUID().toString(), clock, System::nanoTime),
 				new TelemetrySnapshotWriter(directory));
 		}
 	}

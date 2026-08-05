@@ -43,15 +43,34 @@ public class TelemetryStateTest
 {
 	private static final String INSTANCE_ID = "8e5a1c02-3f47-4d6b-9a10-77c2e5b4f831";
 
+	/** Wall-clock milliseconds. Drives exported timestamps only. */
 	private long now;
+
+	/**
+	 * Monotonic elapsed nanoseconds. Drives cadence only, and is moved independently of
+	 * {@link #now} so a test can prove one cannot influence the other.
+	 */
+	private long elapsed;
+
 	private TelemetryState state;
 
 	@Before
 	public void setUp()
 	{
 		now = 1_770_000_000_000L;
-		LongSupplier clock = () -> now;
-		state = new TelemetryState(INSTANCE_ID, clock);
+		// Deliberately not zero, and deliberately negative, because System.nanoTime has no
+		// meaningful origin and is permitted to be negative. Anything that treats an elapsed
+		// reading as an absolute quantity rather than a difference fails here.
+		elapsed = -4_000_000_000L;
+		LongSupplier wallClock = () -> now;
+		LongSupplier elapsedClock = () -> elapsed;
+		state = new TelemetryState(INSTANCE_ID, wallClock, elapsedClock);
+	}
+
+	/** Advances monotonic elapsed time by a millisecond amount, leaving wall time alone. */
+	private void elapseMillis(long millis)
+	{
+		elapsed += millis * 1_000_000L;
 	}
 
 	private void logIn()
@@ -483,7 +502,7 @@ public class TelemetryStateTest
 		state.seedXpBaseline("COOKING", 800);
 		state.observeXp("COOKING", 850);
 
-		TelemetryState reEnabled = new TelemetryState(INSTANCE_ID, () -> now);
+		TelemetryState reEnabled = new TelemetryState(INSTANCE_ID, () -> now, () -> elapsed);
 		reEnabled.updateSession("LOGGED_IN", true);
 		assertEquals("a fresh run starts at sequence zero", 0L, reEnabled.getNextSeq());
 
@@ -515,23 +534,147 @@ public class TelemetryStateTest
 	@Test
 	public void experienceEarnedWhileStartupWasQueuedIsExportedRatherThanAbsorbed()
 	{
-		// Two gains land before initialization: 1000 -> 1046 -> 1092.
+		// Two gains land before initialization: 1000 -> 1046 -> 1092, at distinct times.
+		now = 1_770_000_001_000L;
 		assertTrue(state.recordPreInitialXp("THIEVING", 1_046));
-		assertFalse("only the earliest total per skill is kept", state.recordPreInitialXp("THIEVING", 1_092));
+		now = 1_770_000_002_000L;
+		assertFalse("one aggregate entry per skill", state.recordPreInitialXp("THIEVING", 1_092));
 
 		logIn();
-		now = 1_770_000_005_000L;
-		// Startup finally runs and seeds from the live total.
+		// Startup finally runs, much later, and seeds from the live total.
+		now = 1_770_000_009_000L;
 		assertTrue(state.seedXpBaseline("THIEVING", 1_092));
 
 		String json = state.nextSnapshot(true).toJson();
 		assertEquals("\"thieving\"", value(json, "lastSkill"));
-		assertEquals("the measurable part of the window's experience", "46", value(json, "lastDelta"));
-		assertEquals("1770000005000", value(json, "lastChangedAt"));
+		assertEquals("the measurable span between the two retained events", "46", value(json, "lastDelta"));
+		assertEquals("the second event's time, not the seeding time", "1770000002000",
+			value(json, "lastChangedAt"));
 
 		// The baseline still ends at the live total, so the next gain measures from the truth.
 		assertTrue(state.observeXp("THIEVING", 1_100));
 		assertEquals("8", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	/**
+	 * The regression proof for the round-5 finding. Against the behavior at d9cb9ea the delta
+	 * was stamped with the wall clock read at seeding, so this asserts the one thing that
+	 * distinguishes the two implementations: a long, quiet gap between the last event and
+	 * seeding must not move the exported time at all.
+	 */
+	@Test
+	public void aLongStartupDelayDoesNotMoveTheExportedExperienceTime()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("THIEVING", 1_046);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("THIEVING", 1_092);
+
+		logIn();
+		// A loading screen or a busy client can hold startup for a long time. Nothing about the
+		// experience already earned changes because of it.
+		now = 1_770_000_600_000L;
+		assertTrue(state.seedXpBaseline("THIEVING", 1_092));
+
+		assertEquals("1770000002000", value(state.nextSnapshot(true).toJson(), "lastChangedAt"));
+	}
+
+	/**
+	 * Three events, so a first-writer-wins timestamp and a seeding-time timestamp are both
+	 * distinguishable failures rather than coincidentally equal to the right answer.
+	 */
+	@Test
+	public void threeRetainedEventsAggregateTheSpanAndUseTheLatestEventTime()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("THIEVING", 1_046);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("THIEVING", 1_092);
+		now = 1_770_000_003_000L;
+		state.recordPreInitialXp("THIEVING", 1_150);
+
+		logIn();
+		now = 1_770_000_050_000L;
+		assertTrue(state.seedXpBaseline("THIEVING", 1_150));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("the whole measurable span, 1150 - 1046", "104", value(json, "lastDelta"));
+		assertEquals("the third event's time, not the first and not the seed",
+			"1770000003000", value(json, "lastChangedAt"));
+	}
+
+	/**
+	 * Experience earned between the last retained event and seeding has no event of its own.
+	 * Stretching the delta to cover it would mean stamping that part with a time no event
+	 * happened at, so only the retained span is reported and the baseline absorbs the rest.
+	 */
+	@Test
+	public void experienceWithNoRetainedEventIsNotGivenAnInventedTime()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("MINING", 5_000);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("MINING", 5_040);
+
+		logIn();
+		now = 1_770_000_009_000L;
+		// The live total is higher than anything retained: more was earned, unobserved.
+		assertTrue(state.seedXpBaseline("MINING", 5_100));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("only the span two events actually bound", "40", value(json, "lastDelta"));
+		assertEquals("1770000002000", value(json, "lastChangedAt"));
+
+		// The unreported remainder is absorbed by the baseline, so it is not counted twice.
+		assertTrue(state.observeXp("MINING", 5_130));
+		assertEquals("30", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	/**
+	 * Retained evidence above the total the client now reports means the two disagree.
+	 * Reporting a span measured against contradicted evidence would fabricate a gain.
+	 */
+	@Test
+	public void retainedEvidenceAboveTheLiveTotalCannotFabricateADelta()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("MINING", 5_000);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("MINING", 9_999);
+
+		logIn();
+		assertTrue(state.seedXpBaseline("MINING", 5_050));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("no gain is reported from contradicted evidence", "null", value(json, "lastSkill"));
+		assertEquals("null", value(json, "lastDelta"));
+		assertEquals("null", value(json, "lastChangedAt"));
+
+		// The live total governs from here.
+		assertTrue(state.observeXp("MINING", 5_090));
+		assertEquals("40", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	/** A measurable retained span marks the state dirty once, not once per retained event. */
+	@Test
+	public void measurableRetainedExperienceMarksTheStateDirtyExactlyOnce()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("THIEVING", 1_046);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("THIEVING", 1_092);
+
+		logIn();
+		state.nextSnapshot(true);
+		state.recordPublished();
+		assertFalse(state.isDirty());
+
+		assertTrue(state.seedXpBaseline("THIEVING", 1_092));
+		assertTrue("a measurable retained gain is exported, so it must publish", state.isDirty());
+
+		state.nextSnapshot(true);
+		state.recordPublished();
+		assertFalse("and it must not keep republishing afterwards", state.isDirty());
 	}
 
 	/**
@@ -591,19 +734,82 @@ public class TelemetryStateTest
 	}
 
 	@Test
-	public void retainedTotalsAreBoundedPerSkillAndRejectInvalidEntries()
+	public void retainedEvidenceIsBoundedPerSkillAndRejectsInvalidEntries()
 	{
-		assertTrue(state.recordPreInitialXp("FISHING", 100));
-		assertFalse("one entry per skill, first writer wins", state.recordPreInitialXp("FISHING", 200));
+		now = 1_770_000_001_000L;
+		assertTrue("the first observation creates the entry", state.recordPreInitialXp("FISHING", 100));
+		now = 1_770_000_002_000L;
+		assertFalse("a later observation updates that entry rather than adding one",
+			state.recordPreInitialXp("FISHING", 200));
+		now = 1_770_000_003_000L;
 		assertFalse("case does not create a second entry", state.recordPreInitialXp("fishing", 300));
 		assertFalse("a null skill name is refused", state.recordPreInitialXp(null, 100));
 		assertFalse("the OVERALL sentinel is refused", state.recordPreInitialXp("OVERALL", 12_345_678));
 		assertFalse("a negative total is refused", state.recordPreInitialXp("MINING", -1));
 
 		logIn();
-		// The single retained entry still governs, proving the later ones were not stored.
-		assertTrue(state.seedXpBaseline("FISHING", 250));
-		assertEquals("150", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+		now = 1_770_000_020_000L;
+		// One aggregate entry spanning 100..300, whatever the number of observations.
+		assertTrue(state.seedXpBaseline("FISHING", 300));
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("200", value(json, "lastDelta"));
+		assertEquals("1770000003000", value(json, "lastChangedAt"));
+	}
+
+	/**
+	 * Equal and lower readings are not events the exported span represents, so neither the
+	 * totals nor the timestamp may follow them. A transient zero is the case that matters: a
+	 * baseline that followed one down would export the whole skill as a single gain.
+	 */
+	@Test
+	public void equalAndLowerRetainedReadingsMoveNeitherTotalNorTimestamp()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("MINING", 5_000);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("MINING", 5_040);
+
+		// None of these may move anything.
+		now = 1_770_000_003_000L;
+		state.recordPreInitialXp("MINING", 5_040);
+		now = 1_770_000_004_000L;
+		state.recordPreInitialXp("MINING", 4_000);
+		now = 1_770_000_005_000L;
+		state.recordPreInitialXp("MINING", 0);
+
+		logIn();
+		now = 1_770_000_030_000L;
+		assertTrue(state.seedXpBaseline("MINING", 5_040));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("the span is unchanged by the dips", "40", value(json, "lastDelta"));
+		assertEquals("the timestamp stayed on the last increase", "1770000002000",
+			value(json, "lastChangedAt"));
+	}
+
+	/**
+	 * A transient zero during startup must not become the low end of the span and export the
+	 * player's entire skill as one gain.
+	 */
+	@Test
+	public void aTransientZeroDuringStartupCannotFabricateAWholeSkillGain()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("WOODCUTTING", 1_234_567);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("WOODCUTTING", 0);
+
+		logIn();
+		assertTrue(state.seedXpBaseline("WOODCUTTING", 1_234_567));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("no whole-skill gain is fabricated", "null", value(json, "lastSkill"));
+		assertEquals("null", value(json, "lastDelta"));
+
+		// And the baseline is the truth, so a genuine later gain measures correctly.
+		now = 1_770_000_009_000L;
+		assertTrue(state.observeXp("WOODCUTTING", 1_234_632));
+		assertEquals("65", value(state.nextSnapshot(true).toJson(), "lastDelta"));
 	}
 
 	@Test
@@ -681,20 +887,25 @@ public class TelemetryStateTest
 	}
 
 	@Test
-	public void aTotalRetainedBeforeAHopSurvivesUntilTheSessionGoesLive()
+	public void retainedEvidenceBeforeAHopSurvivesUntilTheSessionGoesLive()
 	{
-		// Experience lands while startup is queued, then startup completes mid-hop.
+		// Two gains land while startup is queued, then startup completes mid-hop.
+		now = 1_770_000_001_000L;
 		assertTrue(state.recordPreInitialXp("AGILITY", 50_000));
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("AGILITY", 50_120);
 		state.updateSession("LOADING", false);
 
-		// The retained total must not have been thrown away by initialization completing.
+		// The retained evidence must not have been thrown away by initialization completing.
 		logIn();
 		assertTrue(state.needsXpBaselineSeeding());
-		now = 1_770_000_005_000L;
+		now = 1_770_000_030_000L;
 		assertTrue(state.seedXpBaseline("AGILITY", 50_120));
 
-		assertEquals("the window's experience is still measured", "120",
-			value(state.nextSnapshot(true).toJson(), "lastDelta"));
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("the window's experience is still measured", "120", value(json, "lastDelta"));
+		assertEquals("and still carries its own event time", "1770000002000",
+			value(json, "lastChangedAt"));
 	}
 
 	@Test
@@ -778,7 +989,7 @@ public class TelemetryStateTest
 		assertEquals(INSTANCE_ID, state.nextSnapshot(true).getInstanceId());
 
 		// A separate start is a separate identity.
-		TelemetryState other = new TelemetryState(UUID.randomUUID().toString(), () -> now);
+		TelemetryState other = new TelemetryState(UUID.randomUUID().toString(), () -> now, () -> elapsed);
 		assertFalse(INSTANCE_ID.equals(other.getInstanceId()));
 	}
 
@@ -807,11 +1018,11 @@ public class TelemetryStateTest
 		assertFalse(state.isDirty());
 		assertFalse(state.isPublicationDue(1_500L));
 
-		// Unchanged state still republishes as a heartbeat.
-		now += 1_500L;
+		// Unchanged state still republishes as a heartbeat, driven by elapsed time.
+		elapseMillis(1_500L);
 		assertTrue(state.isPublicationDue(1_500L));
 
-		now += 1L;
+		elapseMillis(1L);
 		state.nextSnapshot(true);
 		state.recordPublished();
 		assertFalse(state.isPublicationDue(1_500L));
@@ -820,6 +1031,106 @@ public class TelemetryStateTest
 		logIn();
 		assertTrue(state.isDirty());
 		assertTrue(state.isPublicationDue(1_500L));
+	}
+
+	/**
+	 * The defect this fixes: cadence was measured against the wall clock, so an adjustment
+	 * backwards made the elapsed figure negative and kept it negative until wall time caught
+	 * up. A healthy idle plugin stopped heartbeating and its file read as stale.
+	 */
+	@Test
+	public void aBackwardWallClockJumpCannotSuppressAHeartbeat()
+	{
+		state.nextSnapshot(true);
+		state.recordPublished();
+		assertFalse(state.isDirty());
+		assertFalse(state.isPublicationDue(1_500L));
+
+		// The wall clock lurches an hour backwards mid-session.
+		now -= 3_600_000L;
+		assertFalse("a clock adjustment alone is not a heartbeat", state.isPublicationDue(1_500L));
+
+		// Elapsed time is untouched by that, so the heartbeat still arrives on schedule.
+		elapseMillis(1_500L);
+		assertTrue("the heartbeat must not wait for wall time to catch up",
+			state.isPublicationDue(1_500L));
+	}
+
+	@Test
+	public void aForwardWallClockJumpCannotForceAHeartbeat()
+	{
+		state.nextSnapshot(true);
+		state.recordPublished();
+		assertFalse(state.isPublicationDue(1_500L));
+
+		// A large forward correction must not manufacture cadence that has not elapsed.
+		now += 3_600_000L;
+		assertFalse("wall time cannot bring a heartbeat forward", state.isPublicationDue(1_500L));
+
+		elapseMillis(1_499L);
+		assertFalse("still short of the interval", state.isPublicationDue(1_500L));
+		elapseMillis(1L);
+		assertTrue("due exactly when the elapsed interval is reached", state.isPublicationDue(1_500L));
+	}
+
+	@Test
+	public void aDirtyStateIsDueImmediatelyWhateverEitherClockSays()
+	{
+		state.nextSnapshot(true);
+		state.recordPublished();
+		assertFalse(state.isPublicationDue(1_500L));
+
+		logIn();
+		assertTrue(state.isDirty());
+		assertTrue("a change publishes without consulting any interval",
+			state.isPublicationDue(1_500L));
+
+		// Even with the wall clock dragged backwards.
+		now -= 3_600_000L;
+		assertTrue(state.isPublicationDue(1_500L));
+	}
+
+	/**
+	 * The heartbeat is measured from the last snapshot a reader could genuinely have seen. A
+	 * publication that was refused or failed never called {@link TelemetryState#recordPublished()},
+	 * so the interval must keep running rather than restarting on an attempt that wrote nothing.
+	 */
+	@Test
+	public void aPublicationThatNeverReachedTheFileDoesNotRestartTheHeartbeatInterval()
+	{
+		state.nextSnapshot(true);
+		state.recordPublished();
+		assertFalse(state.isPublicationDue(1_500L));
+
+		elapseMillis(1_400L);
+		// An attempt that is refused or fails builds a snapshot but never records it.
+		state.nextSnapshot(true);
+		elapseMillis(100L);
+
+		assertTrue("the interval runs from the last committed publication, not the last attempt",
+			state.isPublicationDue(1_500L));
+	}
+
+	/** Exported timestamps must keep following wall time, not the cadence source. */
+	@Test
+	public void exportedTimestampsFollowWallTimeWhileCadenceFollowsElapsedTime()
+	{
+		logIn();
+		state.observeXp("WOODCUTTING", 1_000);
+
+		// Elapsed time races ahead; it must not appear in any exported field.
+		elapseMillis(500_000L);
+		now = 1_770_000_007_000L;
+		assertTrue(state.observeXp("WOODCUTTING", 1_065));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("1770000007000", value(json, "emittedAt"));
+		assertEquals("1770000007000", value(json, "lastChangedAt"));
+
+		// And wall time moving does not by itself satisfy the cadence.
+		state.recordPublished();
+		now += 60_000L;
+		assertFalse(state.isPublicationDue(1_500L));
 	}
 
 	@Test

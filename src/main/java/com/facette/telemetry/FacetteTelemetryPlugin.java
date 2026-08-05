@@ -27,6 +27,7 @@ package com.facette.telemetry;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -35,6 +36,8 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
@@ -89,17 +92,59 @@ public class FacetteTelemetryPlugin extends Plugin
 	/** Bound on how long an orderly shutdown waits for an in-flight publication. */
 	private static final long SHUTDOWN_TIMEOUT_SECONDS = 5L;
 
+	/**
+	 * Package-private rather than private so a same-package test can supply a stand-in without
+	 * reflection. Still {@code @Inject}, so RuneLite's own field injection is unchanged, and
+	 * still invisible outside this package.
+	 */
 	@Inject
-	private Client client;
+	Client client;
 
 	/**
 	 * RuneLite's client-thread dispatcher. Every direct {@link Client} read has to happen on
 	 * the client thread; enabling the plugin from the configuration panel calls
 	 * {@link #startUp()} on Swing's AWT thread, so startup work is handed here rather than
 	 * run on whichever thread happened to call.
+	 *
+	 * <p>Package-private for the same reason as {@link #client}.
 	 */
 	@Inject
-	private ClientThread clientThread;
+	ClientThread clientThread;
+
+	/**
+	 * Wall-clock milliseconds, for exported timestamps only. Injectable so a test can hold time
+	 * still or move it deliberately; in production it is always the real system clock.
+	 */
+	private final LongSupplier wallClockMillis;
+
+	/**
+	 * Monotonic elapsed nanoseconds, for interval decisions only. Separate from the wall clock
+	 * so a test can advance cadence without moving exported timestamps, and vice versa.
+	 */
+	private final LongSupplier elapsedNanos;
+
+	/**
+	 * Supplies each run's instance identity. Injectable only so a test can assert that separate
+	 * runs get separate identities; in production it is a fresh random UUID per start, derived
+	 * from nothing about the account, machine, or game state.
+	 */
+	private final Supplier<String> instanceIds;
+
+	/**
+	 * Supplies the directory the snapshot is written to. Injectable so a test writes into an
+	 * isolated temporary directory instead of the operator's real RuneLite data directory. In
+	 * production it always resolves to that real directory and nothing else — this seam does
+	 * not change the destination, and it is not reachable from configuration, an environment
+	 * variable, or a system property.
+	 */
+	private final Supplier<Path> dataDirectories;
+
+	/**
+	 * Supplies each run's publisher executor. Injectable so a test can drive publication on a
+	 * thread it controls and assert the executor is disposed of; in production it is always a
+	 * single daemon thread, as before.
+	 */
+	private final Supplier<ScheduledExecutorService> executors;
 
 	/**
 	 * Serializes the <em>commit</em> step of publications across runs — the authority check and
@@ -123,17 +168,49 @@ public class FacetteTelemetryPlugin extends Plugin
 	 */
 	private volatile PublisherRunContext currentRun;
 
+	/**
+	 * The constructor RuneLite and Guice use. Public and no-argument, exactly as before, so the
+	 * normal construction path is unchanged: collaborators still arrive by field injection.
+	 */
+	public FacetteTelemetryPlugin()
+	{
+		this(
+			System::currentTimeMillis,
+			System::nanoTime,
+			() -> UUID.randomUUID().toString(),
+			FacetteTelemetryPlugin::runeLiteDataDirectory,
+			FacetteTelemetryPlugin::newPublisherExecutor);
+	}
+
+	/**
+	 * Test seam. Package-private, so nothing outside this package can reach it, and it is not
+	 * exposed as plugin configuration, an environment variable, or a system property. Every
+	 * argument the no-argument constructor passes is the real production implementation, so
+	 * the seam changes no production behavior, destination, or schema — it only lets a test
+	 * make the lifecycle deterministic without launching a client.
+	 */
+	FacetteTelemetryPlugin(LongSupplier wallClockMillis, LongSupplier elapsedNanos,
+		Supplier<String> instanceIds, Supplier<Path> dataDirectories,
+		Supplier<ScheduledExecutorService> executors)
+	{
+		this.wallClockMillis = Objects.requireNonNull(wallClockMillis, "wallClockMillis");
+		this.elapsedNanos = Objects.requireNonNull(elapsedNanos, "elapsedNanos");
+		this.instanceIds = Objects.requireNonNull(instanceIds, "instanceIds");
+		this.dataDirectories = Objects.requireNonNull(dataDirectories, "dataDirectories");
+		this.executors = Objects.requireNonNull(executors, "executors");
+	}
+
 	@Override
 	protected void startUp()
 	{
 		// A fresh identity every start, derived from nothing: not the account, the profile,
 		// the machine, or any game state. It only lets a reader notice a restart. The new
 		// state also starts the sequence at zero with no experience baselines.
-		String instanceId = UUID.randomUUID().toString();
+		String instanceId = instanceIds.get();
 		PublisherRunContext run = PublisherRunContext.begin(
 			newestGeneration,
-			new TelemetryState(instanceId, System::currentTimeMillis),
-			new TelemetrySnapshotWriter(dataDirectory()));
+			new TelemetryState(instanceId, wallClockMillis, elapsedNanos),
+			new TelemetrySnapshotWriter(dataDirectories.get()));
 		currentRun = run;
 
 		// Nothing here touches the client. Enabling from the configuration panel runs this on
@@ -188,12 +265,7 @@ public class FacetteTelemetryPlugin extends Plugin
 
 	private void startPublisher(PublisherRunContext run)
 	{
-		ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(runnable ->
-		{
-			Thread thread = new Thread(runnable, "facette-telemetry-publisher");
-			thread.setDaemon(true);
-			return thread;
-		});
+		ScheduledExecutorService executor = executors.get();
 		// Adopted before anything is scheduled on it. The first tick has a zero initial delay
 		// and can run before scheduleWithFixedDelay even returns, so a disable landing in that
 		// gap has to find a publisher to stop — otherwise the executor leaks and the run ends
@@ -560,9 +632,26 @@ public class FacetteTelemetryPlugin extends Plugin
 		}
 	}
 
-	/** The plugin's data directory inside RuneLite's canonical data directory. */
-	private static Path dataDirectory()
+	/**
+	 * The plugin's data directory inside RuneLite's canonical data directory. The production
+	 * destination, and the only one the no-argument constructor ever supplies.
+	 */
+	private static Path runeLiteDataDirectory()
 	{
 		return new File(RuneLite.RUNELITE_DIR, DATA_SUBDIRECTORY).toPath();
+	}
+
+	/**
+	 * The production publisher: one daemon thread per run, named so it is identifiable in a
+	 * thread dump, and daemon so it can never hold the client open.
+	 */
+	private static ScheduledExecutorService newPublisherExecutor()
+	{
+		return Executors.newSingleThreadScheduledExecutor(runnable ->
+		{
+			Thread thread = new Thread(runnable, "facette-telemetry-publisher");
+			thread.setDaemon(true);
+			return thread;
+		});
 	}
 }
