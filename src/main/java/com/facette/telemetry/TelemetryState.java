@@ -39,9 +39,11 @@ import java.util.function.LongSupplier;
  * exercisable without a game client.
  *
  * <p>Threading: mutators are called from the RuneLite client thread and the publication
- * methods from a single publisher thread, so every method is synchronized on this instance.
- * {@link #nextSnapshot(boolean)} and {@link #recordPublished()} are a pair and assume one
- * publisher at a time, which is what {@link FacetteTelemetryPlugin} provides.
+ * methods from whichever thread is publishing, so every method is synchronized on this
+ * instance. {@link #nextSnapshot(boolean)} and {@link #recordPublished()} are a pair that
+ * requires one publication at a time; {@link FacetteTelemetryPlugin} guarantees that with a
+ * lock held across the whole build-write-record sequence, including the final write on
+ * shutdown, which otherwise could race the publisher thread.
  *
  * <p>The per-skill experience baselines are session-local comparison state and are never
  * exported.

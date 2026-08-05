@@ -32,6 +32,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
@@ -82,10 +83,25 @@ public class FacetteTelemetryPlugin extends Plugin
 	/** Directory created inside RuneLite's canonical data directory. */
 	private static final String DATA_SUBDIRECTORY = "facette";
 
+	/** Bound on how long an orderly shutdown waits for an in-flight publication. */
 	private static final long SHUTDOWN_TIMEOUT_SECONDS = 5L;
 
 	@Inject
 	private Client client;
+
+	/**
+	 * Serializes publications. Held across the whole build-write-record sequence so that two
+	 * threads can never interleave snapshots, reorder them on disk, or share a sequence
+	 * number — in particular the publisher thread and the client thread performing the final
+	 * shutdown write.
+	 */
+	private final ReentrantLock publishLock = new ReentrantLock();
+
+	/**
+	 * Set before shutdown takes the lock, so a publication already queued behind it does not
+	 * write an active snapshot after the final inactive one.
+	 */
+	private volatile boolean shuttingDown;
 
 	private TelemetryState state;
 	private TelemetrySnapshotWriter writer;
@@ -101,6 +117,9 @@ public class FacetteTelemetryPlugin extends Plugin
 		String instanceId = UUID.randomUUID().toString();
 		state = new TelemetryState(instanceId, System::currentTimeMillis);
 		writer = new TelemetrySnapshotWriter(dataDirectory());
+		// RuneLite reuses this instance across disable/enable, so the previous shutdown's
+		// flag must not suppress this run's publications.
+		shuttingDown = false;
 
 		sampleClientState();
 
@@ -120,6 +139,11 @@ public class FacetteTelemetryPlugin extends Plugin
 	@Override
 	protected void shutDown()
 	{
+		// Order matters. The flag is raised first so that any publication still waiting on
+		// the lock abandons itself rather than writing an active snapshot after the final
+		// inactive one. Stopping the schedule prevents new ones from being queued at all.
+		shuttingDown = true;
+
 		if (publishTask != null)
 		{
 			publishTask.cancel(false);
@@ -127,27 +151,58 @@ public class FacetteTelemetryPlugin extends Plugin
 		}
 		if (executor != null)
 		{
+			// Non-blocking: ordering against an in-flight publication comes from the lock
+			// below, not from waiting for the executor to terminate.
 			executor.shutdown();
-			try
-			{
-				executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-			}
-			catch (InterruptedException e)
-			{
-				Thread.currentThread().interrupt();
-			}
 			executor = null;
 		}
 
-		// One final snapshot on the same instance, reporting the plugin as inactive and
-		// logged out with every gameplay-derived field null. The publisher is already
-		// stopped, so nothing races this write.
 		if (state != null && writer != null)
 		{
-			publish(false);
+			writeFinalSnapshot();
 		}
 
 		log.debug("Facette Telemetry stopped");
+	}
+
+	/**
+	 * Writes the final snapshot on the same instance, reporting the plugin as inactive and
+	 * logged out with every gameplay-derived field null.
+	 *
+	 * <p>Taking the publication lock is what makes this write last: a publication already
+	 * inside {@link TelemetrySnapshotWriter#write} finishes first, and one that has not
+	 * started yet sees {@link #shuttingDown} and does nothing. If the in-flight write is
+	 * stalled beyond the timeout the final snapshot is skipped rather than raced onto disk
+	 * out of order — the file then stops advancing, and a reader detects it as stale by its
+	 * timestamp exactly as it would after a hard process termination.
+	 */
+	private void writeFinalSnapshot()
+	{
+		boolean acquired = false;
+		try
+		{
+			acquired = publishLock.tryLock(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+		}
+		catch (InterruptedException e)
+		{
+			Thread.currentThread().interrupt();
+		}
+
+		if (!acquired)
+		{
+			log.warn("Timed out waiting for an in-flight publication; skipping the final "
+				+ "snapshot. {} will stop advancing and reads as stale.", writer.getTarget());
+			return;
+		}
+
+		try
+		{
+			publish(false);
+		}
+		finally
+		{
+			publishLock.unlock();
+		}
 	}
 
 	@Subscribe
@@ -225,12 +280,23 @@ public class FacetteTelemetryPlugin extends Plugin
 
 	private void publishTick()
 	{
-		if (state.isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
+		publishLock.lock();
+		try
 		{
-			publish(true);
+			// Re-checked under the lock: a tick that was waiting here while shutdown ran
+			// must not write an active snapshot over the final inactive one.
+			if (!shuttingDown && state.isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
+			{
+				publish(true);
+			}
+		}
+		finally
+		{
+			publishLock.unlock();
 		}
 	}
 
+	/** Publishes one snapshot. Callers must hold {@link #publishLock}. */
 	private void publish(boolean pluginActive)
 	{
 		TelemetrySnapshot snapshot = state.nextSnapshot(pluginActive);
