@@ -172,7 +172,11 @@ rather than taking this README's word for it.
 
 ## License
 
-BSD 2-Clause. See [LICENSE](LICENSE).
+Source code in this repository is licensed under the BSD 2-Clause License unless a
+subdirectory states otherwise. See [LICENSE](LICENSE).
+
+"Facette" and associated branding are not granted under this license.
 
 Old School RuneScape is a trademark of Jagex Ltd. RuneLite is an independent open-source
-project. This repository is affiliated with neither.
+project. This repository is affiliated with neither, and nothing here is approved or
+endorsed by Jagex, RuneLite, or the RuneLite Plugin Hub.
