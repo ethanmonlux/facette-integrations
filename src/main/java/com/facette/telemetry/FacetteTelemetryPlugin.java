@@ -157,9 +157,11 @@ public class FacetteTelemetryPlugin extends Plugin
 			executor = null;
 		}
 
-		if (state != null && writer != null)
+		TelemetryState finalState = state;
+		TelemetrySnapshotWriter finalWriter = writer;
+		if (finalState != null && finalWriter != null)
 		{
-			writeFinalSnapshot();
+			writeFinalSnapshot(finalState, finalWriter);
 		}
 
 		log.debug("Facette Telemetry stopped");
@@ -175,8 +177,12 @@ public class FacetteTelemetryPlugin extends Plugin
 	 * stalled beyond the timeout the final snapshot is skipped rather than raced onto disk
 	 * out of order — the file then stops advancing, and a reader detects it as stale by its
 	 * timestamp exactly as it would after a hard process termination.
+	 *
+	 * <p>The state and writer are passed in rather than read from the fields, because that
+	 * skipped case is exactly when a disable/re-enable can replace them while the stalled
+	 * publication is still running.
 	 */
-	private void writeFinalSnapshot()
+	private void writeFinalSnapshot(TelemetryState finalState, TelemetrySnapshotWriter finalWriter)
 	{
 		boolean acquired = false;
 		try
@@ -191,13 +197,13 @@ public class FacetteTelemetryPlugin extends Plugin
 		if (!acquired)
 		{
 			log.warn("Timed out waiting for an in-flight publication; skipping the final "
-				+ "snapshot. {} will stop advancing and reads as stale.", writer.getTarget());
+				+ "snapshot. {} will stop advancing and reads as stale.", finalWriter.getTarget());
 			return;
 		}
 
 		try
 		{
-			publish(false);
+			publish(finalState, finalWriter, false);
 		}
 		finally
 		{
@@ -283,11 +289,17 @@ public class FacetteTelemetryPlugin extends Plugin
 		publishLock.lock();
 		try
 		{
+			// Bound once, then used throughout: a stalled write can outlive shutDown(), and a
+			// disable/re-enable in that window replaces these fields. A publication must
+			// finish against the instances that produced it, never a later run's.
+			TelemetryState publishingState = state;
+			TelemetrySnapshotWriter publishingWriter = writer;
+
 			// Re-checked under the lock: a tick that was waiting here while shutdown ran
 			// must not write an active snapshot over the final inactive one.
-			if (!shuttingDown && state.isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
+			if (!shuttingDown && publishingState.isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
 			{
-				publish(true);
+				publish(publishingState, publishingWriter, true);
 			}
 		}
 		finally
@@ -296,22 +308,28 @@ public class FacetteTelemetryPlugin extends Plugin
 		}
 	}
 
-	/** Publishes one snapshot. Callers must hold {@link #publishLock}. */
-	private void publish(boolean pluginActive)
+	/**
+	 * Publishes one snapshot. Callers must hold {@link #publishLock} and must pass the state
+	 * and writer they intend the publication to belong to, rather than letting it re-read
+	 * fields a concurrent restart may have replaced.
+	 */
+	private void publish(TelemetryState publishingState, TelemetrySnapshotWriter publishingWriter,
+		boolean pluginActive)
 	{
-		TelemetrySnapshot snapshot = state.nextSnapshot(pluginActive);
+		TelemetrySnapshot snapshot = publishingState.nextSnapshot(pluginActive);
 		try
 		{
-			int bytes = writer.write(snapshot);
-			// The sequence advances only for a snapshot that actually reached the file.
-			state.recordPublished();
+			int bytes = publishingWriter.write(snapshot);
+			// The sequence advances only for a snapshot that actually reached the file, and
+			// only on the state that issued it.
+			publishingState.recordPublished();
 			log.debug("Published telemetry snapshot seq={} ({} bytes)", snapshot.getSeq(), bytes);
 		}
 		catch (IOException e)
 		{
 			// Logged without the payload, and without advancing the sequence: the next
 			// publication retries the same sequence number.
-			log.warn("Unable to publish telemetry snapshot to {}", writer.getTarget(), e);
+			log.warn("Unable to publish telemetry snapshot to {}", publishingWriter.getTarget(), e);
 		}
 	}
 
