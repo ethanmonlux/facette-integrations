@@ -167,6 +167,9 @@ public class FacetteTelemetryPlugin extends Plugin
 			{
 				seedXpBaselines(run.getState());
 			}
+			// Anything seeding did not consume — in practice a startup that found no live
+			// session — is dropped here rather than left to influence a later seed.
+			run.getState().discardPreInitialXp();
 			// Only now may anything publish: the state has been sampled and the experience
 			// baselines seeded, so no snapshot can be built from a partly initialized run.
 			run.markInitialized();
@@ -277,9 +280,13 @@ public class FacetteTelemetryPlugin extends Plugin
 	 *
 	 * <p>Returning null until initialization completes is what keeps events out of a partly
 	 * built run: an event that arrives between {@code startUp()} and the client-thread callback
-	 * is dropped rather than queued. Nothing is lost by that — the first periodic sample after
-	 * initialization reads the live client state and reconciles whatever those events would
-	 * have carried — and it avoids an unbounded backlog of pending events.
+	 * is dropped rather than queued, and no backlog can build up. For game state, world, vitals,
+	 * and inventory nothing is lost by that, because the first periodic sample after
+	 * initialization reads the live client state and reconciles whatever those events carried.
+	 *
+	 * <p>Experience is the exception, and is handled separately in
+	 * {@link #onStatChanged(StatChanged)}: experience gains are event-only and a later sample
+	 * cannot reconstruct them, so dropping those events outright would lose them.
 	 *
 	 * <p>Called from the RuneLite client thread only, which is also the thread that replaces
 	 * the run, so a handler never observes a half-started one.
@@ -290,15 +297,39 @@ public class FacetteTelemetryPlugin extends Plugin
 		return run != null && run.isCurrent() && run.isInitialized() ? run.getState() : null;
 	}
 
+	/**
+	 * The telemetry state of a run that has started but not yet finished initializing, or null
+	 * when there is no such run.
+	 *
+	 * <p>The counterpart to {@link #currentState()}, and deliberately a separate accessor: the
+	 * only thing permitted to reach a run through it is retaining an experience total, which
+	 * publishes nothing and builds no snapshot.
+	 */
+	private TelemetryState startingState()
+	{
+		PublisherRunContext run = currentRun;
+		return run != null && run.isCurrent() && !run.isInitialized() ? run.getState() : null;
+	}
+
 	@Subscribe
 	public void onGameStateChanged(GameStateChanged gameStateChanged)
 	{
+		GameState gameState = gameStateChanged.getGameState();
 		TelemetryState state = currentState();
 		if (state == null)
 		{
+			// Still starting. The transition itself needs no handling — the first sample after
+			// initialization reads the live state — but a session *ending* has to be acted on
+			// now. Experience totals retained during startup belong to the session that ended,
+			// and if startup spans a logout and a new login, seeding against them would measure
+			// one character's total against another's and export a gain that never happened.
+			TelemetryState starting = startingState();
+			if (starting != null && endsSession(gameState))
+			{
+				starting.discardPreInitialXp();
+			}
 			return;
 		}
-		GameState gameState = gameStateChanged.getGameState();
 		// One atomic transition. Applied as two calls, a publication could slip between them
 		// and observe the experience baselines already discarded while the session still read
 		// as live and still carried the previous world, vitals, and inventory.
@@ -315,13 +346,35 @@ public class FacetteTelemetryPlugin extends Plugin
 		sampleClientState(currentState());
 	}
 
+	/**
+	 * Records an experience total, either as an observation or — before the run has finished
+	 * initializing — as a total to be measured against once it has.
+	 *
+	 * <p>Experience is the one thing a later sample cannot reconstruct. World, vitals, and
+	 * inventory are all re-read on the next periodic sample, so an event dropped during the
+	 * deferred startup window costs nothing. A gain is not a value the client holds; it is the
+	 * difference between two totals, and if the earlier total is discarded the gain is gone.
+	 * Seeding afterwards from the live totals would then quietly absorb everything earned while
+	 * startup was queued, and absorb more the longer the client took to run the callback.
+	 */
 	@Subscribe
 	public void onStatChanged(StatChanged statChanged)
 	{
-		TelemetryState state = currentState();
 		Skill skill = statChanged.getSkill();
-		if (state == null || skill == null)
+		if (skill == null)
 		{
+			return;
+		}
+		TelemetryState state = currentState();
+		if (state == null)
+		{
+			// Still starting. The total is retained rather than acted on: no baseline exists to
+			// measure it against yet, and nothing here publishes or builds a snapshot.
+			TelemetryState starting = startingState();
+			if (starting != null)
+			{
+				starting.recordPreInitialXp(skill.name(), statChanged.getXp());
+			}
 			return;
 		}
 		// Only the skill and the increase are kept; the total is used as a comparison

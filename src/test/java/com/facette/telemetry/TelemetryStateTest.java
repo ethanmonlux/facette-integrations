@@ -507,6 +507,151 @@ public class TelemetryStateTest
 		assertFalse(state.isPublicationDue(1_500L));
 	}
 
+	/**
+	 * The defect this fixes: startup is deferred onto the client thread, so experience events
+	 * can land before any baseline exists. Seeding afterwards from the live total absorbed
+	 * every gain earned in that window, and absorbed more the longer startup stayed queued.
+	 */
+	@Test
+	public void experienceEarnedWhileStartupWasQueuedIsExportedRatherThanAbsorbed()
+	{
+		// Two gains land before initialization: 1000 -> 1046 -> 1092.
+		assertTrue(state.recordPreInitialXp("THIEVING", 1_046));
+		assertFalse("only the earliest total per skill is kept", state.recordPreInitialXp("THIEVING", 1_092));
+
+		logIn();
+		now = 1_770_000_005_000L;
+		// Startup finally runs and seeds from the live total.
+		assertTrue(state.seedXpBaseline("THIEVING", 1_092));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("\"thieving\"", value(json, "lastSkill"));
+		assertEquals("the measurable part of the window's experience", "46", value(json, "lastDelta"));
+		assertEquals("1770000005000", value(json, "lastChangedAt"));
+
+		// The baseline still ends at the live total, so the next gain measures from the truth.
+		assertTrue(state.observeXp("THIEVING", 1_100));
+		assertEquals("8", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	/**
+	 * The residual limit, pinned deliberately. Experience events carry a running total and not
+	 * a delta, and the pre-gain total cannot be read off the client thread, so the first gain
+	 * per skill inside the startup window is unmeasurable however this is arranged. What must
+	 * not happen is a fabricated gain in its place.
+	 */
+	@Test
+	public void theFirstGainInsideTheStartupWindowIsUnmeasurableAndIsNotInvented()
+	{
+		state.recordPreInitialXp("THIEVING", 1_046);
+		logIn();
+		// Exactly one gain landed, so the earliest total seen already equals the live total.
+		assertTrue(state.seedXpBaseline("THIEVING", 1_046));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("no gain is fabricated", "null", value(json, "lastSkill"));
+		assertEquals("null", value(json, "lastDelta"));
+
+		// And the baseline is correct, so the next genuine gain is exported in full.
+		assertTrue(state.observeXp("THIEVING", 1_092));
+		assertEquals("46", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void aRetainedTotalNeverLowersOrReplacesAnExistingBaseline()
+	{
+		logIn();
+		state.observeXp("MINING", 5_000);
+
+		// A stale retained total must not reopen a baseline a real observation established.
+		state.recordPreInitialXp("MINING", 1);
+		assertFalse(state.seedXpBaseline("MINING", 5_000));
+		assertFalse("the retained total was consumed, not left to act later",
+			state.seedXpBaseline("MINING", 5_000));
+
+		assertTrue("the original baseline still governs", state.observeXp("MINING", 5_040));
+		assertEquals("40", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void aRetainedTotalAboveTheLiveTotalIsIgnoredRatherThanReportedAsALoss()
+	{
+		// A transient high reading must not produce a negative delta or a fabricated gain.
+		state.recordPreInitialXp("MINING", 9_999);
+		logIn();
+		assertTrue(state.seedXpBaseline("MINING", 5_000));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("null", value(json, "lastSkill"));
+		assertEquals("null", value(json, "lastDelta"));
+
+		// The live total governs from here.
+		assertTrue(state.observeXp("MINING", 5_040));
+		assertEquals("40", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void retainedTotalsAreBoundedPerSkillAndRejectInvalidEntries()
+	{
+		assertTrue(state.recordPreInitialXp("FISHING", 100));
+		assertFalse("one entry per skill, first writer wins", state.recordPreInitialXp("FISHING", 200));
+		assertFalse("case does not create a second entry", state.recordPreInitialXp("fishing", 300));
+		assertFalse("a null skill name is refused", state.recordPreInitialXp(null, 100));
+		assertFalse("the OVERALL sentinel is refused", state.recordPreInitialXp("OVERALL", 12_345_678));
+		assertFalse("a negative total is refused", state.recordPreInitialXp("MINING", -1));
+
+		logIn();
+		// The single retained entry still governs, proving the later ones were not stored.
+		assertTrue(state.seedXpBaseline("FISHING", 250));
+		assertEquals("150", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void discardingRetainedTotalsStopsThemInfluencingALaterSeed()
+	{
+		state.recordPreInitialXp("FISHING", 100);
+		state.discardPreInitialXp();
+
+		logIn();
+		assertTrue(state.seedXpBaseline("FISHING", 250));
+		assertEquals("nothing is reported from a discarded total", "null",
+			value(state.nextSnapshot(true).toJson(), "lastSkill"));
+	}
+
+	@Test
+	public void aStartupSpanningALogoutDoesNotCarryItsTotalIntoTheNextLogin()
+	{
+		state.recordPreInitialXp("FISHING", 100);
+		// The session ends before startup finished, discarding session-local experience.
+		state.updateSession("LOGIN_SCREEN", false, true);
+
+		logIn();
+		assertTrue(state.seedXpBaseline("FISHING", 250));
+		assertEquals("a previous session's total cannot become this login's baseline", "null",
+			value(state.nextSnapshot(true).toJson(), "lastSkill"));
+	}
+
+	/**
+	 * The same protection by the route the plugin actually uses during the startup window,
+	 * where the transition itself is not applied and only the discard reaches the state. A
+	 * retained total surviving a logout would measure one character's experience against
+	 * another's and export a gain that never happened.
+	 */
+	@Test
+	public void discardingOnSessionEndProtectsAgainstMeasuringAcrossCharacters()
+	{
+		state.recordPreInitialXp("FISHING", 100);
+		state.discardPreInitialXp();
+
+		// A different character logs in with a far higher total in the same skill.
+		logIn();
+		assertTrue(state.seedXpBaseline("FISHING", 5_000_000));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("no cross-character gain is exported", "null", value(json, "lastSkill"));
+		assertEquals("null", value(json, "lastDelta"));
+	}
+
 	@Test
 	public void experienceIsNotObservedWhileLoggedOut()
 	{

@@ -70,6 +70,19 @@ final class TelemetryState
 	/** Session-local total-experience baselines, keyed by lowercase skill name. */
 	private final Map<String, Integer> xpBaselines = new HashMap<>();
 
+	/**
+	 * Earliest total experience seen per skill while the run was still starting, keyed by
+	 * lowercase skill name and emptied once initialization completes.
+	 *
+	 * <p>Startup is deferred onto the client thread, so experience events can arrive before
+	 * any baseline exists. Their totals are held here rather than dropped, because seeding
+	 * afterwards from the live totals would silently absorb every gain that landed in that
+	 * window — and the window is as long as the client takes to drain its queue, not a fixed
+	 * tick. One entry per skill, first writer wins, so the map is bounded by the number of
+	 * skills no matter how long startup stays queued.
+	 */
+	private final Map<String, Integer> preInitialXp = new HashMap<>();
+
 	private boolean dirty = true;
 
 	/** Monotonic counter incremented whenever a change marks the state dirty. */
@@ -160,6 +173,9 @@ final class TelemetryState
 		if (sessionEnded)
 		{
 			xpBaselines.clear();
+			// A total observed during a startup that spanned a logout belongs to the session
+			// that ended, and must not become a later login's baseline.
+			preInitialXp.clear();
 			markIfChanged(lastSkill, null);
 			lastSkill = null;
 			lastDelta = null;
@@ -241,6 +257,12 @@ final class TelemetryState
 	 * caller enumerates skills programmatically and a non-real entry could appear in that
 	 * enumeration; experience events, by contrast, always carry a real skill.
 	 *
+	 * <p>When {@link #recordPreInitialXp(String, int)} captured an earlier total for the skill,
+	 * that total is the baseline instead of the live one, and the difference is reported as a
+	 * genuine gain. Without this, experience earned while startup was still queued would be
+	 * absorbed into the baseline and never exported, and the amount absorbed would grow with
+	 * however long the client took to run the callback.
+	 *
 	 * @param totalXp the client's current total for the skill; zero is legitimate for an
 	 *                untrained skill and is seeded, while a negative total is refused
 	 * @return true when this call established a new baseline
@@ -256,16 +278,76 @@ final class TelemetryState
 		{
 			return false;
 		}
+		// Consumed whether or not it is used, so a total held for a skill that already has a
+		// baseline cannot survive to influence anything later.
+		Integer earliest = preInitialXp.remove(skill);
 		// Never lowers or replaces: a baseline already established by a real observation, or
 		// by an earlier seed, is the more trustworthy one.
 		if (xpBaselines.containsKey(skill))
 		{
 			return false;
 		}
+
+		if (earliest == null || earliest >= totalXp)
+		{
+			xpBaselines.put(skill, totalXp);
+			// Deliberately not marked dirty. Seeding alone changes nothing that is exported, so
+			// it must not by itself cause a publication or advance the sequence.
+			return true;
+		}
+
+		// Experience arrived while startup was still queued. The earliest total seen is the
+		// closest thing to a pre-gain baseline this run will ever have, so the measurable part
+		// of that experience is reported rather than buried. The baseline still advances to the
+		// live total, exactly as an ordinary observation would leave it.
 		xpBaselines.put(skill, totalXp);
-		// Deliberately not marked dirty. Seeding changes nothing that is exported, so it must
-		// not by itself cause a publication or advance the sequence.
+		lastSkill = skill;
+		lastDelta = totalXp - earliest;
+		lastChangedAt = clock.getAsLong();
+		markDirty();
 		return true;
+	}
+
+	/**
+	 * Retains a skill's total experience reported before the run finished initializing.
+	 *
+	 * <p>Deliberately does not require {@code loggedIn}: during this window the client has not
+	 * been sampled yet, so the session is not yet known to be live, and refusing on that basis
+	 * would discard exactly the events this exists to keep.
+	 *
+	 * <p>Only the first total per skill is kept. A later one is not more useful — the baseline
+	 * wanted is the earliest — and ignoring it is what bounds the map at one entry per skill.
+	 *
+	 * <p>This can never report a gain by itself. The total it holds is already the total
+	 * <em>after</em> whichever gain prompted the event, and the total before it is not
+	 * knowable: experience events carry a running total, not a delta, and reading the client
+	 * requires the client thread this run has not reached yet. So the first gain per skill
+	 * inside the startup window is unmeasurable by construction; every later one is preserved.
+	 *
+	 * @return true when this call retained a total for a skill that had none
+	 */
+	synchronized boolean recordPreInitialXp(String skillName, int totalXp)
+	{
+		if (skillName == null || totalXp < 0)
+		{
+			return false;
+		}
+		String skill = skillName.toLowerCase(Locale.ROOT);
+		if (OVERALL_SKILL_NAME.equals(skill))
+		{
+			return false;
+		}
+		return preInitialXp.putIfAbsent(skill, totalXp) == null;
+	}
+
+	/**
+	 * Drops any retained pre-initialization totals that seeding did not consume — in practice
+	 * a startup that found no live session to seed from. Nothing may carry into the initialized
+	 * run, which from then on gets its baselines from observations alone.
+	 */
+	synchronized void discardPreInitialXp()
+	{
+		preInitialXp.clear();
 	}
 
 	/**
