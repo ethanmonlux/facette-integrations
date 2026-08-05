@@ -98,13 +98,11 @@ public class FacetteTelemetryPlugin extends Plugin
 	private final ReentrantLock publishLock = new ReentrantLock();
 
 	/**
-	 * Set before shutdown takes the lock, so a publication already queued behind it does not
-	 * write an active snapshot after the final inactive one.
+	 * The run currently being published. Replaced, never mutated, on each start; the previous
+	 * run is retired first and can never become current again.
 	 */
-	private volatile boolean shuttingDown;
+	private volatile PublisherRunContext currentRun;
 
-	private TelemetryState state;
-	private TelemetrySnapshotWriter writer;
 	private ScheduledExecutorService executor;
 	private ScheduledFuture<?> publishTask;
 
@@ -115,11 +113,10 @@ public class FacetteTelemetryPlugin extends Plugin
 		// the machine, or any game state. It only lets a reader notice a restart. The new
 		// state also starts the sequence at zero with no experience baselines.
 		String instanceId = UUID.randomUUID().toString();
-		state = new TelemetryState(instanceId, System::currentTimeMillis);
-		writer = new TelemetrySnapshotWriter(dataDirectory());
-		// RuneLite reuses this instance across disable/enable, so the previous shutdown's
-		// flag must not suppress this run's publications.
-		shuttingDown = false;
+		PublisherRunContext run = new PublisherRunContext(
+			new TelemetryState(instanceId, System::currentTimeMillis),
+			new TelemetrySnapshotWriter(dataDirectory()));
+		currentRun = run;
 
 		sampleClientState();
 
@@ -129,20 +126,29 @@ public class FacetteTelemetryPlugin extends Plugin
 			thread.setDaemon(true);
 			return thread;
 		});
+		// The task is bound to this run for its whole life. It never reads the field, so a
+		// later start cannot redirect it at a newer run's state or writer.
 		// A zero initial delay publishes the active snapshot as soon as the plugin starts.
 		publishTask = executor.scheduleWithFixedDelay(
-			this::publishTick, 0L, PUBLISH_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+			() -> publishTick(run), 0L, PUBLISH_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
 
-		log.debug("Facette Telemetry started; publishing to {}", writer.getTarget());
+		log.debug("Facette Telemetry started; publishing to {}", run.getWriter().getTarget());
 	}
 
 	@Override
 	protected void shutDown()
 	{
-		// Order matters. The flag is raised first so that any publication still waiting on
-		// the lock abandons itself rather than writing an active snapshot after the final
-		// inactive one. Stopping the schedule prevents new ones from being queued at all.
-		shuttingDown = true;
+		PublisherRunContext run = currentRun;
+
+		// Order matters. Retiring the run first means a task already waiting on the
+		// publication lock abandons itself when it finally acquires the lock, rather than
+		// writing an active snapshot after the final inactive one — and because retirement
+		// is scoped to this context, a rapid re-enable creates a *different* run and cannot
+		// bring this one back. Stopping the schedule prevents new ticks being queued at all.
+		if (run != null)
+		{
+			run.retire();
+		}
 
 		if (publishTask != null)
 		{
@@ -157,11 +163,9 @@ public class FacetteTelemetryPlugin extends Plugin
 			executor = null;
 		}
 
-		TelemetryState finalState = state;
-		TelemetrySnapshotWriter finalWriter = writer;
-		if (finalState != null && finalWriter != null)
+		if (run != null)
 		{
-			writeFinalSnapshot(finalState, finalWriter);
+			writeFinalSnapshot(run);
 		}
 
 		log.debug("Facette Telemetry stopped");
@@ -173,16 +177,18 @@ public class FacetteTelemetryPlugin extends Plugin
 	 *
 	 * <p>Taking the publication lock is what makes this write last: a publication already
 	 * inside {@link TelemetrySnapshotWriter#write} finishes first, and one that has not
-	 * started yet sees {@link #shuttingDown} and does nothing. If the in-flight write is
-	 * stalled beyond the timeout the final snapshot is skipped rather than raced onto disk
-	 * out of order — the file then stops advancing, and a reader detects it as stale by its
+	 * started yet finds its run retired and does nothing. If the in-flight write is stalled
+	 * beyond the timeout the final snapshot is skipped rather than raced onto disk out of
+	 * order — the file then stops advancing, and a reader detects it as stale by its
 	 * timestamp exactly as it would after a hard process termination.
 	 *
-	 * <p>The state and writer are passed in rather than read from the fields, because that
-	 * skipped case is exactly when a disable/re-enable can replace them while the stalled
-	 * publication is still running.
+	 * <p>The run is passed in rather than read from the field, because that skipped case is
+	 * exactly when a disable/re-enable can replace it while the stalled publication is still
+	 * running. This write deliberately does not check {@link PublisherRunContext#isCurrent()}
+	 * — the run it reports as inactive is the one being retired, and it is the whole point of
+	 * the call.
 	 */
-	private void writeFinalSnapshot(TelemetryState finalState, TelemetrySnapshotWriter finalWriter)
+	private void writeFinalSnapshot(PublisherRunContext run)
 	{
 		boolean acquired = false;
 		try
@@ -197,13 +203,13 @@ public class FacetteTelemetryPlugin extends Plugin
 		if (!acquired)
 		{
 			log.warn("Timed out waiting for an in-flight publication; skipping the final "
-				+ "snapshot. {} will stop advancing and reads as stale.", finalWriter.getTarget());
+				+ "snapshot. {} will stop advancing and reads as stale.", run.getWriter().getTarget());
 			return;
 		}
 
 		try
 		{
-			publish(finalState, finalWriter, false);
+			publish(run, false);
 		}
 		finally
 		{
@@ -211,9 +217,25 @@ public class FacetteTelemetryPlugin extends Plugin
 		}
 	}
 
+	/**
+	 * The telemetry state of the run currently being published, or null before the first
+	 * start. Called from the RuneLite client thread only, which is also the thread that
+	 * replaces the run, so a handler never observes a half-started one.
+	 */
+	private TelemetryState currentState()
+	{
+		PublisherRunContext run = currentRun;
+		return run == null ? null : run.getState();
+	}
+
 	@Subscribe
 	public void onGameStateChanged(GameStateChanged gameStateChanged)
 	{
+		TelemetryState state = currentState();
+		if (state == null)
+		{
+			return;
+		}
 		GameState gameState = gameStateChanged.getGameState();
 		// One atomic transition. Applied as two calls, a publication could slip between them
 		// and observe the experience baselines already discarded while the session still read
@@ -231,8 +253,9 @@ public class FacetteTelemetryPlugin extends Plugin
 	@Subscribe
 	public void onStatChanged(StatChanged statChanged)
 	{
+		TelemetryState state = currentState();
 		Skill skill = statChanged.getSkill();
-		if (skill == null)
+		if (state == null || skill == null)
 		{
 			return;
 		}
@@ -247,6 +270,12 @@ public class FacetteTelemetryPlugin extends Plugin
 	 */
 	private void sampleClientState()
 	{
+		TelemetryState state = currentState();
+		if (state == null)
+		{
+			return;
+		}
+
 		GameState gameState = client.getGameState();
 		boolean loggedIn = gameState == GameState.LOGGED_IN;
 		state.updateSession(gameState.name(), loggedIn);
@@ -284,22 +313,31 @@ public class FacetteTelemetryPlugin extends Plugin
 			|| gameState == GameState.LOGGING_IN;
 	}
 
-	private void publishTick()
+	/**
+	 * One scheduled publication attempt, permanently bound to the run that scheduled it.
+	 *
+	 * <p>The run is checked twice on purpose. Once before contending for the lock, so a
+	 * retired run does not queue behind a shutdown write it has no business completing. Once
+	 * again after acquiring it, because the interesting case is the task that was *already*
+	 * waiting when its run was disabled: by the time it wins the lock the plugin may have
+	 * been re-enabled, and only the second check can see that.
+	 */
+	private void publishTick(PublisherRunContext run)
 	{
+		if (!run.isCurrent())
+		{
+			return;
+		}
+
 		publishLock.lock();
 		try
 		{
-			// Bound once, then used throughout: a stalled write can outlive shutDown(), and a
-			// disable/re-enable in that window replaces these fields. A publication must
-			// finish against the instances that produced it, never a later run's.
-			TelemetryState publishingState = state;
-			TelemetrySnapshotWriter publishingWriter = writer;
-
-			// Re-checked under the lock: a tick that was waiting here while shutdown ran
-			// must not write an active snapshot over the final inactive one.
-			if (!shuttingDown && publishingState.isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
+			// Re-checked under the lock: a tick that was waiting here while the plugin was
+			// disabled — and possibly re-enabled — must not publish. Retirement is scoped to
+			// this run, so restarting cannot clear it.
+			if (run.isCurrent() && run.getState().isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
 			{
-				publish(publishingState, publishingWriter, true);
+				publish(run, true);
 			}
 		}
 		finally
@@ -309,17 +347,20 @@ public class FacetteTelemetryPlugin extends Plugin
 	}
 
 	/**
-	 * Publishes one snapshot. Callers must hold {@link #publishLock} and must pass the state
-	 * and writer they intend the publication to belong to, rather than letting it re-read
-	 * fields a concurrent restart may have replaced.
+	 * Publishes one snapshot through the run that owns it. Callers must hold
+	 * {@link #publishLock}.
+	 *
+	 * <p>Everything this touches comes from {@code run}, so a publication can only ever reach
+	 * the state, writer, sequence, and bookkeeping of the run that issued it — never a later
+	 * one's, whatever the interleaving.
 	 */
-	private void publish(TelemetryState publishingState, TelemetrySnapshotWriter publishingWriter,
-		boolean pluginActive)
+	private void publish(PublisherRunContext run, boolean pluginActive)
 	{
+		TelemetryState publishingState = run.getState();
 		TelemetrySnapshot snapshot = publishingState.nextSnapshot(pluginActive);
 		try
 		{
-			int bytes = publishingWriter.write(snapshot);
+			int bytes = run.getWriter().write(snapshot);
 			// The sequence advances only for a snapshot that actually reached the file, and
 			// only on the state that issued it.
 			publishingState.recordPublished();
@@ -329,7 +370,7 @@ public class FacetteTelemetryPlugin extends Plugin
 		{
 			// Logged without the payload, and without advancing the sequence: the next
 			// publication retries the same sequence number.
-			log.warn("Unable to publish telemetry snapshot to {}", publishingWriter.getTarget(), e);
+			log.warn("Unable to publish telemetry snapshot to {}", run.getWriter().getTarget(), e);
 		}
 	}
 
