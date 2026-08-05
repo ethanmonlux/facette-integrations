@@ -29,6 +29,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.UUID;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -191,9 +192,27 @@ public class FacetteTelemetryPlugin extends Plugin
 		// The task is bound to this run for its whole life. It never reads a field, so a later
 		// start cannot redirect it at a newer run's state or writer.
 		// A zero initial delay publishes the active snapshot as soon as the plugin starts.
-		ScheduledFuture<?> publishTask = executor.scheduleWithFixedDelay(
-			() -> publishTick(run), 0L, PUBLISH_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
-		run.attachPublisher(executor, publishTask);
+		// Adopted before anything is scheduled on it. The first tick has a zero initial delay
+		// and can run before scheduleWithFixedDelay even returns, so a disable landing in that
+		// gap has to find a publisher to stop — otherwise the executor leaks and the run ends
+		// with no final snapshot while a tick already in flight commits an active one.
+		run.attachPublisher(executor);
+		try
+		{
+			// The task is bound to this run for its whole life. It never reads a field, so a
+			// later start cannot redirect it at a newer run's state or writer.
+			ScheduledFuture<?> publishTask = executor.scheduleWithFixedDelay(
+				() -> publishTick(run), 0L, PUBLISH_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+			run.attachPublishTask(publishTask);
+		}
+		catch (RejectedExecutionException e)
+		{
+			// shutDown() claimed the executor between adoption and scheduling. It already owns
+			// the cleanup and the final write, so there is nothing to schedule and nothing to
+			// repair here.
+			log.debug("Publisher was shut down while starting; no periodic task scheduled");
+			return;
+		}
 
 		log.debug("Facette Telemetry started; publishing to {}", run.getWriter().getTarget());
 	}
@@ -412,21 +431,12 @@ public class FacetteTelemetryPlugin extends Plugin
 		{
 			return;
 		}
-
-		publishLock.lock();
-		try
+		// The lock is taken inside publish(), which is also where the commit decision is made,
+		// so the due-check does not need it. A change landing between here and there only
+		// costs a redundant publication.
+		if (run.getState().isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
 		{
-			// Re-checked under the lock: a tick that was waiting here while the plugin was
-			// disabled — and possibly re-enabled — must not publish. Retirement is scoped to
-			// this run, so restarting cannot clear it.
-			if (run.isCurrent() && run.getState().isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
-			{
-				publish(run, true);
-			}
-		}
-		finally
-		{
-			publishLock.unlock();
+			publish(run, true);
 		}
 	}
 
@@ -440,32 +450,45 @@ public class FacetteTelemetryPlugin extends Plugin
 	 */
 	private void publish(PublisherRunContext run, boolean pluginActive)
 	{
-		TelemetryState publishingState = run.getState();
-		TelemetrySnapshot snapshot = publishingState.nextSnapshot(pluginActive);
+		// Held across build, authorization, and target replacement — not merely around the
+		// decision to publish. Authorization and the move have to be one indivisible step: a
+		// retired run's final write could otherwise be authorized, then have a newer run
+		// publish, then complete its move and bury that newer snapshot under an inactive one.
+		// Every publication path goes through here, so no caller can forget to take it.
+		publishLock.lock();
 		try
 		{
-			// The authority check runs inside the writer, immediately before it replaces the
-			// target — not here, where a slow write could make the answer stale before it
-			// mattered. A run that lost authority while staging throws below.
-			int bytes = run.getWriter().write(snapshot, run::isCommitAuthorized);
-			// The sequence advances only for a snapshot that actually reached the file, and
-			// only on the state that issued it.
-			publishingState.recordPublished();
-			log.debug("Published telemetry snapshot seq={} ({} bytes)", snapshot.getSeq(), bytes);
+			TelemetryState publishingState = run.getState();
+			TelemetrySnapshot snapshot = publishingState.nextSnapshot(pluginActive);
+			try
+			{
+				// The authority check runs inside the writer, immediately before it replaces the
+				// target — not here, where a slow write could make the answer stale before it
+				// mattered. A run that lost authority while staging throws below.
+				int bytes = run.getWriter().write(snapshot, run::isCommitAuthorized);
+				// The sequence advances only for a snapshot that actually reached the file, and
+				// only on the state that issued it.
+				publishingState.recordPublished();
+				log.debug("Published telemetry snapshot seq={} ({} bytes)", snapshot.getSeq(), bytes);
+			}
+			catch (TelemetrySnapshotWriter.CommitNotAuthorizedException e)
+			{
+				// Expected whenever a newer run started while this one was writing — the staged
+				// file has been discarded and the target left alone. Not a failure, and not worth
+				// a warning; the sequence and bookkeeping are untouched because recordPublished
+				// was skipped.
+				log.debug("Abandoned a telemetry snapshot superseded by a newer plugin run");
+			}
+			catch (IOException e)
+			{
+				// Logged without the payload, and without advancing the sequence: the next
+				// publication retries the same sequence number.
+				log.warn("Unable to publish telemetry snapshot to {}", run.getWriter().getTarget(), e);
+			}
 		}
-		catch (TelemetrySnapshotWriter.CommitNotAuthorizedException e)
+		finally
 		{
-			// Expected whenever a newer run started while this one was writing — the staged
-			// file has been discarded and the target left alone. Not a failure, and not worth
-			// a warning; the sequence and bookkeeping are untouched because recordPublished
-			// was skipped.
-			log.debug("Abandoned a telemetry snapshot superseded by a newer plugin run");
-		}
-		catch (IOException e)
-		{
-			// Logged without the payload, and without advancing the sequence: the next
-			// publication retries the same sequence number.
-			log.warn("Unable to publish telemetry snapshot to {}", run.getWriter().getTarget(), e);
+			publishLock.unlock();
 		}
 	}
 

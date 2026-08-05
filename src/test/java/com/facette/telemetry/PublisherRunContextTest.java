@@ -370,7 +370,8 @@ public class PublisherRunContextTest
 			t.setDaemon(true);
 			return t;
 		});
-		run.attachPublisher(executor, executor.scheduleWithFixedDelay(
+		run.attachPublisher(executor);
+		run.attachPublishTask(executor.scheduleWithFixedDelay(
 			() -> { }, 1L, 1L, TimeUnit.HOURS));
 
 		CountDownLatch writeStarted = new CountDownLatch(1);
@@ -411,7 +412,8 @@ public class PublisherRunContextTest
 			t.setDaemon(true);
 			return t;
 		});
-		run.attachPublisher(executor, executor.scheduleWithFixedDelay(
+		run.attachPublisher(executor);
+		run.attachPublishTask(executor.scheduleWithFixedDelay(
 			() -> { }, 1L, 1L, TimeUnit.HOURS));
 		assertTrue(run.hasPublisher());
 
@@ -423,6 +425,126 @@ public class PublisherRunContextTest
 		// The periodic task was cancelled, so nothing else can publish afterwards.
 		assertFalse("a second submission has no executor left to accept it",
 			run.submitFinalWrite(() -> { }));
+	}
+
+	/**
+	 * The publisher must count as attached before its first tick is scheduled. The tick runs
+	 * with a zero initial delay, so a disable landing between scheduling and adoption would
+	 * otherwise find no publisher: the executor would leak and no final snapshot would be
+	 * written, while a tick already in flight still committed an active one.
+	 */
+	@Test
+	public void aRunOwnsItsPublisherBeforeAnyTaskIsScheduled()
+	{
+		PublisherRunContext run = newRun();
+		ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r ->
+		{
+			Thread t = new Thread(r, "publisher");
+			t.setDaemon(true);
+			return t;
+		});
+
+		// Adoption happens first, with no task yet — exactly the window the ordering closes.
+		run.attachPublisher(executor);
+		assertTrue("shutdown must be able to find the executor immediately", run.hasPublisher());
+
+		AtomicBoolean finalWriteRan = new AtomicBoolean(false);
+		assertTrue("a final write is submittable with no periodic task attached",
+			run.submitFinalWrite(() -> finalWriteRan.set(true)));
+		assertTrue(run.awaitPublisherTermination(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+		assertTrue("the final snapshot is still written", finalWriteRan.get());
+		assertTrue("the executor was actually stopped, not leaked", executor.isShutdown());
+	}
+
+	/**
+	 * The window between authorization and target replacement. Authorization can say yes and a
+	 * newer run can publish before the move lands, so the two must be one indivisible step.
+	 * This drives that interleaving and asserts the shared publication lock prevents it.
+	 */
+	@Test
+	public void theCommitLockKeepsAnOldFinalWriteFromBuryingANewerPublication() throws Exception
+	{
+		ReentrantLock publishLock = new ReentrantLock();
+		Path shared = folder.getRoot().toPath().resolve("locked");
+		PublisherRunContext runA = new RunBuilder(shared).build();
+		runA.getState().updateSession("LOGGED_IN", true);
+
+		CountDownLatch runAInsideTheLock = new CountDownLatch(1);
+		CountDownLatch runAMayFinish = new CountDownLatch(1);
+
+		// Run A's final write, holding the lock across staging, authorization, and the move —
+		// the discipline the plugin's publish() now enforces for every publication path.
+		Thread runAFinalWrite = new Thread(() ->
+		{
+			publishLock.lock();
+			try
+			{
+				runAInsideTheLock.countDown();
+				runAMayFinish.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+				runA.getWriter().write(
+					runA.getState().nextSnapshot(false), runA::isCommitAuthorized);
+			}
+			catch (TelemetrySnapshotWriter.CommitNotAuthorizedException expected)
+			{
+				// Correct once Run B exists.
+			}
+			catch (IOException e)
+			{
+				throw new IllegalStateException(e);
+			}
+			catch (InterruptedException e)
+			{
+				Thread.currentThread().interrupt();
+			}
+			finally
+			{
+				publishLock.unlock();
+			}
+		}, "run-a-final-write");
+
+		runAFinalWrite.start();
+		assertTrue(runAInsideTheLock.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+		runA.retire();
+		PublisherRunContext runB = new RunBuilder(shared).build();
+		runB.getState().updateSession("LOGGED_IN", true);
+
+		// Run B tries to publish while Run A holds the lock; it must wait rather than interleave.
+		AtomicBoolean runBPublished = new AtomicBoolean(false);
+		Thread runBPublish = new Thread(() ->
+		{
+			publishLock.lock();
+			try
+			{
+				runB.getWriter().write(runB.getState().nextSnapshot(true), runB::isCommitAuthorized);
+				runBPublished.set(true);
+			}
+			catch (IOException e)
+			{
+				throw new IllegalStateException(e);
+			}
+			finally
+			{
+				publishLock.unlock();
+			}
+		}, "run-b-publish");
+		runBPublish.start();
+		awaitQueuedOnLock(publishLock);
+
+		runAMayFinish.countDown();
+		runAFinalWrite.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+		runBPublish.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+		assertFalse(runAFinalWrite.isAlive());
+		assertFalse(runBPublish.isAlive());
+		assertTrue("Run B must have published", runBPublished.get());
+
+		// Whichever order the lock granted, the file ends as Run B's active snapshot: Run A
+		// either committed first and was replaced, or was refused for lack of authority.
+		String onDisk = new String(
+			java.nio.file.Files.readAllBytes(runB.getWriter().getTarget()), StandardCharsets.UTF_8);
+		assertTrue("the newest run's active snapshot must be what survives",
+			onDisk.contains("\"pluginActive\":true"));
+		assertTrue(onDisk.contains(runB.getState().getInstanceId()));
 	}
 
 	/** Builds runs that share one target directory, for cross-run file-contention tests. */

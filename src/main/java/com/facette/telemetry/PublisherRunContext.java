@@ -169,12 +169,26 @@ final class PublisherRunContext
 	}
 
 	/**
-	 * Adopts the publisher thread and its periodic task. Called once, from client-thread
-	 * initialization, after sampling and seeding have succeeded.
+	 * Adopts the publisher thread, before anything is scheduled on it.
+	 *
+	 * <p>Adoption is deliberately separate from — and earlier than — scheduling the periodic
+	 * task. The task runs with a zero initial delay, so it can execute before the scheduling
+	 * call has even returned; if the run only counted as having a publisher after that, a
+	 * disable landing in the gap would find nothing to stop, leak the executor, and skip the
+	 * final snapshot. From this call onward the run owns the thread and shutdown can always
+	 * reach it.
 	 */
-	synchronized void attachPublisher(ExecutorService executor, Future<?> publishTask)
+	synchronized void attachPublisher(ExecutorService executor)
 	{
 		this.executor = executor;
+	}
+
+	/**
+	 * Adopts the periodic task once it has been scheduled. Harmless if shutdown already
+	 * claimed the executor — the task is cancelled below either way.
+	 */
+	synchronized void attachPublishTask(Future<?> publishTask)
+	{
 		this.publishTask = publishTask;
 	}
 
