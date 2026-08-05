@@ -232,11 +232,22 @@ final class TelemetryState
 			return false;
 		}
 		String skill = skillName.toLowerCase(Locale.ROOT);
-		Integer previous = xpBaselines.put(skill, totalXp);
-		if (previous == null || totalXp <= previous)
+		Integer previous = xpBaselines.get(skill);
+		if (previous == null)
 		{
+			// First reading this session: seed the comparison, report nothing.
+			xpBaselines.put(skill, totalXp);
 			return false;
 		}
+		if (totalXp <= previous)
+		{
+			// A total that has not advanced is ignored *without* moving the baseline. Lowering
+			// it would make the eventual return to the true total look like a gain the size of
+			// the dip — and a transient zero, which the client can report while skill data is
+			// still initializing, would then fabricate a gain the size of the whole skill.
+			return false;
+		}
+		xpBaselines.put(skill, totalXp);
 
 		lastSkill = skill;
 		lastDelta = totalXp - previous;

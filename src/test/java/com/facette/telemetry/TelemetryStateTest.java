@@ -209,6 +209,43 @@ public class TelemetryStateTest
 	}
 
 	/**
+	 * A reading that has not advanced must not move the baseline. If it did, returning to the
+	 * true total would look like a gain the size of the dip.
+	 */
+	@Test
+	public void aLowerReadingDoesNotLowerTheBaseline()
+	{
+		logIn();
+		state.observeXp("MINING", 1_000);
+		assertFalse(state.observeXp("MINING", 400));
+
+		// Back to the total we already had: nothing was gained, so nothing is reported.
+		assertFalse("returning to a known total is not a gain", state.observeXp("MINING", 1_000));
+		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
+	}
+
+	/**
+	 * The case that makes the one above matter: the client can report a zero total while skill
+	 * data is still initializing. A baseline that followed it down would fabricate a gain the
+	 * size of the player's entire skill on the next real reading.
+	 */
+	@Test
+	public void aTransientZeroReadingCannotFabricateAWholeSkillGain()
+	{
+		logIn();
+		state.observeXp("WOODCUTTING", 1_234_567);
+		assertFalse(state.observeXp("WOODCUTTING", 0));
+
+		assertFalse("the real total returning is not a gain",
+			state.observeXp("WOODCUTTING", 1_234_567));
+		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
+
+		// A genuine gain after the dip is measured from the true baseline, not from zero.
+		assertTrue(state.observeXp("WOODCUTTING", 1_234_632));
+		assertEquals("65", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	/**
 	 * A session-ending transition must be a single state change, not a clear followed by a
 	 * logout. Applied as two steps, a publication can observe the experience baselines
 	 * already discarded while the session still reads as live and still carries the previous
