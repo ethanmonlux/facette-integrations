@@ -36,6 +36,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileTime;
 import java.util.Objects;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 
 /**
@@ -91,6 +92,25 @@ final class TelemetrySnapshotWriter
 		}
 	}
 
+	/**
+	 * Thrown when a fully staged snapshot is abandoned because the publication lost the right
+	 * to replace the target before it got there — in practice, a newer plugin run started
+	 * while this one was still writing.
+	 *
+	 * <p>An {@link IOException} on purpose: every caller already treats a failed write as
+	 * "did not reach the file", so the sequence, dirty flag, and heartbeat bookkeeping are
+	 * left untouched without any caller needing to know this case exists.
+	 */
+	static final class CommitNotAuthorizedException extends IOException
+	{
+		private static final long serialVersionUID = 1L;
+
+		CommitNotAuthorizedException(Path target)
+		{
+			super("Publication is no longer authorized to replace " + target);
+		}
+	}
+
 	private final Path directory;
 	private final Path target;
 	private final Mover mover;
@@ -119,12 +139,24 @@ final class TelemetrySnapshotWriter
 	/**
 	 * Publishes one snapshot, replacing the target with a complete document.
 	 *
+	 * <p>Staging and committing are separate on purpose. Everything slow — creating the
+	 * directory, creating the temporary sibling, writing it, forcing it to disk, closing it —
+	 * happens first and touches only the temporary file. Only then is {@code commitAuthorized}
+	 * consulted, and only then is the target replaced. Checking at the last possible moment is
+	 * what lets a publication that staged slowly discover, before it does any damage, that a
+	 * newer run has taken over.
+	 *
+	 * @param commitAuthorized evaluated once, immediately before target replacement. When it
+	 *                         reports false the staged file is deleted and the target is left
+	 *                         exactly as it was.
 	 * @return the number of UTF-8 bytes written
-	 * @throws SnapshotTooLargeException if the serialized snapshot exceeds the size ceiling,
-	 *                                   in which case the target is left untouched
+	 * @throws SnapshotTooLargeException     if the serialized snapshot exceeds the size
+	 *                                       ceiling, in which case nothing is staged at all
+	 * @throws CommitNotAuthorizedException  if authorization was lost before replacement
 	 */
-	int write(TelemetrySnapshot snapshot) throws IOException
+	int write(TelemetrySnapshot snapshot, BooleanSupplier commitAuthorized) throws IOException
 	{
+		Objects.requireNonNull(commitAuthorized, "commitAuthorized");
 		byte[] payload = snapshot.toJsonBytes();
 		if (payload.length > MAX_SNAPSHOT_BYTES)
 		{
@@ -148,13 +180,20 @@ final class TelemetrySnapshotWriter
 				channel.force(true);
 			}
 
+			// The staged file is complete and durable. This is the last moment at which
+			// abandoning it costs nothing, so it is where authority is confirmed.
+			if (!commitAuthorized.getAsBoolean())
+			{
+				throw new CommitNotAuthorizedException(target);
+			}
+
 			replaceTarget(temp);
 			return payload.length;
 		}
 		finally
 		{
-			// Whether the move succeeded, failed, or never ran, no temporary file of ours
-			// is left behind by this attempt.
+			// Whether the move succeeded, failed, was refused, or never ran, no temporary
+			// file of ours is left behind by this attempt.
 			Files.deleteIfExists(temp);
 		}
 	}

@@ -25,11 +25,15 @@
 package com.facette.telemetry;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 import static org.junit.Assert.assertEquals;
@@ -63,11 +67,13 @@ public class PublisherRunContextTest
 
 	private LongSupplier clock;
 	private int directoryCounter;
+	private AtomicLong newestGeneration;
 
 	@Before
 	public void setUp()
 	{
 		clock = () -> NOW;
+		newestGeneration = new AtomicLong();
 	}
 
 	private PublisherRunContext newRun()
@@ -76,7 +82,8 @@ public class PublisherRunContextTest
 		// file appearing under another run's directory rather than being masked by a shared
 		// target path.
 		Path directory = folder.getRoot().toPath().resolve("run-" + directoryCounter++);
-		return new PublisherRunContext(
+		return PublisherRunContext.begin(
+			newestGeneration,
 			new TelemetryState(UUID.randomUUID().toString(), clock),
 			new TelemetrySnapshotWriter(directory));
 	}
@@ -85,7 +92,7 @@ public class PublisherRunContextTest
 	private static void publish(PublisherRunContext run, boolean pluginActive) throws IOException
 	{
 		TelemetrySnapshot snapshot = run.getState().nextSnapshot(pluginActive);
-		run.getWriter().write(snapshot);
+		run.getWriter().write(snapshot, run::isCommitAuthorized);
 		run.getState().recordPublished();
 	}
 
@@ -237,6 +244,204 @@ public class PublisherRunContextTest
 		assertNotEquals(oldRun.getWriter(), newRun.getWriter());
 		assertNotEquals(oldRun.getWriter().getTarget(), newRun.getWriter().getTarget());
 		assertNotEquals(oldRun.getState().getInstanceId(), newRun.getState().getInstanceId());
+	}
+
+	// --- generation authority and bounded shutdown (FACETTE-OSRS-PLUGIN-004) ---
+
+	@Test
+	public void onlyTheNewestRunMayCommit()
+	{
+		PublisherRunContext runA = newRun();
+		assertTrue("the only run so far may commit", runA.isCommitAuthorized());
+
+		// Retiring alone must NOT revoke commit authority: a disabled run still has to be able
+		// to write its own final inactive snapshot.
+		runA.retire();
+		assertTrue("a retired run may still commit its final snapshot", runA.isCommitAuthorized());
+
+		// Starting a newer run does revoke it. From here Run A is only allowed to abandon.
+		PublisherRunContext runB = newRun();
+		assertFalse("an older run loses authority the moment a newer one starts",
+			runA.isCommitAuthorized());
+		assertTrue(runB.isCommitAuthorized());
+		assertTrue("generations are monotonic", runB.getGeneration() > runA.getGeneration());
+	}
+
+	/**
+	 * The hazard a naive off-thread shutdown write would reintroduce: Run A stages an inactive
+	 * snapshot, Run B starts and publishes an active one, and Run A's write completes last. The
+	 * file must not end up reporting the plugin inactive while Run B is running.
+	 */
+	@Test
+	public void aDelayedInactiveWriteCannotOverwriteANewerActiveRun() throws Exception
+	{
+		Path shared = folder.getRoot().toPath().resolve("shared");
+		PublisherRunContext runA = new RunBuilder(shared).build();
+
+		CountDownLatch runAStaged = new CountDownLatch(1);
+		CountDownLatch runBPublished = new CountDownLatch(1);
+		AtomicBoolean runACommitted = new AtomicBoolean(false);
+
+		runA.getState().updateSession("LOGGED_IN", true);
+
+		Thread runAFinalWrite = new Thread(() ->
+		{
+			try
+			{
+				TelemetrySnapshot inactive = runA.getState().nextSnapshot(false);
+				runA.getWriter().write(inactive, () ->
+				{
+					// Stand at the commit boundary until Run B has published, then answer
+					// truthfully. This is the exact interleaving, forced deterministically.
+					runAStaged.countDown();
+					try
+					{
+						runBPublished.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+					}
+					catch (InterruptedException e)
+					{
+						Thread.currentThread().interrupt();
+					}
+					return runA.isCommitAuthorized();
+				});
+				runACommitted.set(true);
+			}
+			catch (TelemetrySnapshotWriter.CommitNotAuthorizedException expected)
+			{
+				// The correct outcome.
+			}
+			catch (IOException e)
+			{
+				throw new IllegalStateException(e);
+			}
+		}, "run-a-final-write");
+
+		runAFinalWrite.start();
+		assertTrue("Run A should reach the commit boundary",
+			runAStaged.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+		// Run B starts (revoking Run A's authority) and publishes an active snapshot.
+		runA.retire();
+		PublisherRunContext runB = new RunBuilder(shared).build();
+		runB.getState().updateSession("LOGGED_IN", true);
+		TelemetrySnapshot active = runB.getState().nextSnapshot(true);
+		runB.getWriter().write(active, runB::isCommitAuthorized);
+		runBPublished.countDown();
+
+		runAFinalWrite.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+		assertFalse("Run A's write should have finished", runAFinalWrite.isAlive());
+		assertFalse("Run A must not have committed over Run B", runACommitted.get());
+
+		String onDisk = new String(
+			java.nio.file.Files.readAllBytes(runB.getWriter().getTarget()), StandardCharsets.UTF_8);
+		assertTrue("the file must still be Run B's active snapshot",
+			onDisk.contains("\"pluginActive\":true"));
+		assertTrue(onDisk.contains(runB.getState().getInstanceId()));
+		assertFalse("Run A's identity must not be on disk",
+			onDisk.contains(runA.getState().getInstanceId()));
+	}
+
+	@Test
+	public void aRunWithNoPublisherHasNothingToStopOrWaitFor()
+	{
+		PublisherRunContext run = newRun();
+		assertFalse("no publisher was ever attached", run.hasPublisher());
+		assertFalse("there is no final write to submit", run.submitFinalWrite(() -> { }));
+		assertTrue("waiting on nothing returns immediately",
+			run.awaitPublisherTermination(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+		// Abandoning is safe and idempotent, which is what a failed start relies on.
+		run.abandonPublisher();
+		run.abandonPublisher();
+		assertFalse(run.hasPublisher());
+	}
+
+	/**
+	 * The shutdown bound: a stalled final write must not hold the caller. On the real client
+	 * that caller is RuneLite's client thread, so this is the responsiveness guarantee.
+	 */
+	@Test
+	public void shutdownReturnsWithinItsBoundWhileTheFinalWriteIsStalled() throws Exception
+	{
+		PublisherRunContext run = newRun();
+		ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r ->
+		{
+			Thread t = new Thread(r, "stalled-publisher");
+			t.setDaemon(true);
+			return t;
+		});
+		run.attachPublisher(executor, executor.scheduleWithFixedDelay(
+			() -> { }, 1L, 1L, TimeUnit.HOURS));
+
+		CountDownLatch writeStarted = new CountDownLatch(1);
+		CountDownLatch releaseWrite = new CountDownLatch(1);
+
+		assertTrue(run.submitFinalWrite(() ->
+		{
+			writeStarted.countDown();
+			try
+			{
+				releaseWrite.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+			}
+			catch (InterruptedException e)
+			{
+				Thread.currentThread().interrupt();
+			}
+		}));
+		assertTrue("the final write should have started",
+			writeStarted.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+		// The bound elapses while the write is deliberately stuck.
+		assertFalse("a stalled write must not report termination",
+			run.awaitPublisherTermination(50L, TimeUnit.MILLISECONDS));
+
+		// The caller is free; the write is still going.
+		releaseWrite.countDown();
+		assertTrue("it finishes once unstuck",
+			run.awaitPublisherTermination(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+	}
+
+	@Test
+	public void aSubmittedFinalWriteRunsAndTerminatesThePublisher() throws Exception
+	{
+		PublisherRunContext run = newRun();
+		ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r ->
+		{
+			Thread t = new Thread(r, "publisher");
+			t.setDaemon(true);
+			return t;
+		});
+		run.attachPublisher(executor, executor.scheduleWithFixedDelay(
+			() -> { }, 1L, 1L, TimeUnit.HOURS));
+		assertTrue(run.hasPublisher());
+
+		AtomicBoolean ran = new AtomicBoolean(false);
+		assertTrue(run.submitFinalWrite(() -> ran.set(true)));
+		assertTrue(run.awaitPublisherTermination(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+		assertTrue("the final write must actually run", ran.get());
+
+		// The periodic task was cancelled, so nothing else can publish afterwards.
+		assertFalse("a second submission has no executor left to accept it",
+			run.submitFinalWrite(() -> { }));
+	}
+
+	/** Builds runs that share one target directory, for cross-run file-contention tests. */
+	private final class RunBuilder
+	{
+		private final Path directory;
+
+		RunBuilder(Path directory)
+		{
+			this.directory = directory;
+		}
+
+		PublisherRunContext build()
+		{
+			return PublisherRunContext.begin(
+				newestGeneration,
+				new TelemetryState(UUID.randomUUID().toString(), clock),
+				new TelemetrySnapshotWriter(directory));
+		}
 	}
 
 	/**

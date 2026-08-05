@@ -32,6 +32,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -44,6 +45,7 @@ import net.runelite.api.events.GameTick;
 import net.runelite.api.events.StatChanged;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.client.RuneLite;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
@@ -90,21 +92,32 @@ public class FacetteTelemetryPlugin extends Plugin
 	private Client client;
 
 	/**
-	 * Serializes publications. Held across the whole build-write-record sequence so that two
-	 * threads can never interleave snapshots, reorder them on disk, or share a sequence
-	 * number — in particular the publisher thread and the client thread performing the final
-	 * shutdown write.
+	 * RuneLite's client-thread dispatcher. Every direct {@link Client} read has to happen on
+	 * the client thread; enabling the plugin from the configuration panel calls
+	 * {@link #startUp()} on Swing's AWT thread, so startup work is handed here rather than
+	 * run on whichever thread happened to call.
+	 */
+	@Inject
+	private ClientThread clientThread;
+
+	/**
+	 * Serializes publications across runs. Within a run the single publisher thread already
+	 * orders them; this matters when a retired run's final write and a new run's publisher
+	 * are alive at the same time, on different threads.
 	 */
 	private final ReentrantLock publishLock = new ReentrantLock();
+
+	/**
+	 * Generation counter shared by every run of this plugin instance. A run may replace the
+	 * target file only while it is still the newest generation started.
+	 */
+	private final AtomicLong newestGeneration = new AtomicLong();
 
 	/**
 	 * The run currently being published. Replaced, never mutated, on each start; the previous
 	 * run is retired first and can never become current again.
 	 */
 	private volatile PublisherRunContext currentRun;
-
-	private ScheduledExecutorService executor;
-	private ScheduledFuture<?> publishTask;
 
 	@Override
 	protected void startUp()
@@ -113,33 +126,74 @@ public class FacetteTelemetryPlugin extends Plugin
 		// the machine, or any game state. It only lets a reader notice a restart. The new
 		// state also starts the sequence at zero with no experience baselines.
 		String instanceId = UUID.randomUUID().toString();
-		PublisherRunContext run = new PublisherRunContext(
+		PublisherRunContext run = PublisherRunContext.begin(
+			newestGeneration,
 			new TelemetryState(instanceId, System::currentTimeMillis),
 			new TelemetrySnapshotWriter(dataDirectory()));
 		currentRun = run;
 
-		// Ordering matters, and all of it happens on the client thread before the publisher
-		// exists. The run and its state are created first; sampling then records whether this
-		// is a live session; seeding fills the experience baselines only if it is. Because the
-		// executor is not started until after all of that, no publication can observe a
-		// half-initialized run, and none of these client calls happens under the publication
-		// lock — nothing here can block the client thread on the publisher.
-		if (sampleClientState())
+		// Nothing here touches the client. Enabling from the configuration panel runs this on
+		// AWT-EventQueue-0, where any Client read fails the client-thread assertion, so the
+		// reads are deferred instead. invoke() runs the callback inline when the caller is
+		// already the client thread and queues it otherwise, so one path serves both.
+		clientThread.invoke(() -> initializeOnClientThread(run));
+	}
+
+	/**
+	 * Completes startup on RuneLite's client thread: sample, seed, then publish.
+	 *
+	 * <p>Runs later than {@link #startUp()} when the plugin was enabled from the configuration
+	 * panel, so the first thing it does is establish that the run it was created for is still
+	 * the one that matters. A user who disabled the plugin in the meantime — or disabled and
+	 * re-enabled it — leaves this callback bound to a retired run, and it must do nothing at
+	 * all rather than sample state, seed baselines, start a publisher, or write over whatever
+	 * the newer run has already put on disk.
+	 */
+	private void initializeOnClientThread(PublisherRunContext run)
+	{
+		if (!run.isCurrent())
 		{
-			seedXpBaselines(run.getState());
+			log.debug("Skipping startup for a run retired before its client-thread callback ran");
+			return;
 		}
 
-		executor = Executors.newSingleThreadScheduledExecutor(runnable ->
+		try
+		{
+			if (sampleClientState(run.getState()))
+			{
+				seedXpBaselines(run.getState());
+			}
+			// Only now may anything publish: the state has been sampled and the experience
+			// baselines seeded, so no snapshot can be built from a partly initialized run.
+			run.markInitialized();
+			startPublisher(run);
+		}
+		catch (RuntimeException | Error e)
+		{
+			// Leave nothing half-started. The run is retired so any straggler is inert, no
+			// publisher is left behind, and no active snapshot is written — the file simply
+			// stops advancing and reads as stale, which is honest about a failed start.
+			run.retire();
+			run.abandonPublisher();
+			log.error("Facette Telemetry failed to start; no telemetry will be published", e);
+			throw e;
+		}
+	}
+
+	private void startPublisher(PublisherRunContext run)
+	{
+		ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(runnable ->
 		{
 			Thread thread = new Thread(runnable, "facette-telemetry-publisher");
 			thread.setDaemon(true);
 			return thread;
 		});
-		// The task is bound to this run for its whole life. It never reads the field, so a
-		// later start cannot redirect it at a newer run's state or writer.
+		// The task is bound to this run for its whole life. It never reads a field, so a later
+		// start cannot redirect it at a newer run's state or writer.
 		// A zero initial delay publishes the active snapshot as soon as the plugin starts.
-		publishTask = executor.scheduleWithFixedDelay(
+		ScheduledFuture<?> publishTask = executor.scheduleWithFixedDelay(
 			() -> publishTick(run), 0L, PUBLISH_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+		run.attachPublisher(executor, publishTask);
 
 		log.debug("Facette Telemetry started; publishing to {}", run.getWriter().getTarget());
 	}
@@ -148,93 +202,65 @@ public class FacetteTelemetryPlugin extends Plugin
 	protected void shutDown()
 	{
 		PublisherRunContext run = currentRun;
-
-		// Order matters. Retiring the run first means a task already waiting on the
-		// publication lock abandons itself when it finally acquires the lock, rather than
-		// writing an active snapshot after the final inactive one — and because retirement
-		// is scoped to this context, a rapid re-enable creates a *different* run and cannot
-		// bring this one back. Stopping the schedule prevents new ticks being queued at all.
-		if (run != null)
+		if (run == null)
 		{
-			run.retire();
-		}
-
-		if (publishTask != null)
-		{
-			publishTask.cancel(false);
-			publishTask = null;
-		}
-		if (executor != null)
-		{
-			// Non-blocking: ordering against an in-flight publication comes from the lock
-			// below, not from waiting for the executor to terminate.
-			executor.shutdown();
-			executor = null;
-		}
-
-		if (run != null)
-		{
-			writeFinalSnapshot(run);
-		}
-
-		log.debug("Facette Telemetry stopped");
-	}
-
-	/**
-	 * Writes the final snapshot on the same instance, reporting the plugin as inactive and
-	 * logged out with every gameplay-derived field null.
-	 *
-	 * <p>Taking the publication lock is what makes this write last: a publication already
-	 * inside {@link TelemetrySnapshotWriter#write} finishes first, and one that has not
-	 * started yet finds its run retired and does nothing. If the in-flight write is stalled
-	 * beyond the timeout the final snapshot is skipped rather than raced onto disk out of
-	 * order — the file then stops advancing, and a reader detects it as stale by its
-	 * timestamp exactly as it would after a hard process termination.
-	 *
-	 * <p>The run is passed in rather than read from the field, because that skipped case is
-	 * exactly when a disable/re-enable can replace it while the stalled publication is still
-	 * running. This write deliberately does not check {@link PublisherRunContext#isCurrent()}
-	 * — the run it reports as inactive is the one being retired, and it is the whole point of
-	 * the call.
-	 */
-	private void writeFinalSnapshot(PublisherRunContext run)
-	{
-		boolean acquired = false;
-		try
-		{
-			acquired = publishLock.tryLock(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-		}
-		catch (InterruptedException e)
-		{
-			Thread.currentThread().interrupt();
-		}
-
-		if (!acquired)
-		{
-			log.warn("Timed out waiting for an in-flight publication; skipping the final "
-				+ "snapshot. {} will stop advancing and reads as stale.", run.getWriter().getTarget());
 			return;
 		}
 
-		try
+		// Retiring first means a pending startup callback, and any tick already waiting on the
+		// publication lock, both become inert. Retirement is scoped to this context, so a rapid
+		// re-enable creates a different run and cannot bring this one back.
+		run.retire();
+
+		if (!run.hasPublisher())
 		{
-			publish(run, false);
+			// Never got as far as publishing — a startup that failed, or one disabled before
+			// its client-thread callback ran. Deliberately writes nothing: a run that never
+			// published has no state worth reporting, and emitting an inactive seq 0 snapshot
+			// for every failed start would churn the file and tell a reader nothing true.
+			run.abandonPublisher();
+			log.debug("Facette Telemetry stopped before it published; no final snapshot written");
+			return;
 		}
-		finally
+
+		// The final write goes to the run's own publisher thread, not this one. On the real
+		// client this method runs on the client thread (or AWT), and the write can stall for
+		// as long as the filesystem takes — directory creation, force(true), and the target
+		// move are not interruptible in any way this code could rely on. So it is queued, and
+		// this thread waits only a bounded time for an acknowledgement.
+		run.submitFinalWrite(() -> publish(run, false));
+
+		if (run.awaitPublisherTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS))
 		{
-			publishLock.unlock();
+			log.debug("Facette Telemetry stopped");
+			return;
 		}
+
+		// Returning here is the point: the caller is released on time. The write continues on
+		// a daemon thread and will replace the target only if it still holds authority when it
+		// gets there, so if the plugin is re-enabled first it is refused rather than landing an
+		// inactive snapshot on top of the new run.
+		log.warn("Final telemetry snapshot did not complete within {}s; continuing off-thread. "
+			+ "It will be abandoned if the plugin is re-enabled first.", SHUTDOWN_TIMEOUT_SECONDS);
 	}
 
 	/**
-	 * The telemetry state of the run currently being published, or null before the first
-	 * start. Called from the RuneLite client thread only, which is also the thread that
-	 * replaces the run, so a handler never observes a half-started one.
+	 * The telemetry state of the run currently publishing, or null when there is none yet or
+	 * it has not finished initializing.
+	 *
+	 * <p>Returning null until initialization completes is what keeps events out of a partly
+	 * built run: an event that arrives between {@code startUp()} and the client-thread callback
+	 * is dropped rather than queued. Nothing is lost by that — the first periodic sample after
+	 * initialization reads the live client state and reconciles whatever those events would
+	 * have carried — and it avoids an unbounded backlog of pending events.
+	 *
+	 * <p>Called from the RuneLite client thread only, which is also the thread that replaces
+	 * the run, so a handler never observes a half-started one.
 	 */
 	private TelemetryState currentState()
 	{
 		PublisherRunContext run = currentRun;
-		return run == null ? null : run.getState();
+		return run != null && run.isCurrent() && run.isInitialized() ? run.getState() : null;
 	}
 
 	@Subscribe
@@ -256,7 +282,10 @@ public class FacetteTelemetryPlugin extends Plugin
 	@Subscribe
 	public void onGameTick(GameTick gameTick)
 	{
-		sampleClientState();
+		// Also the reconciliation point for anything that happened before initialization
+		// finished: this reads the live client state, so events dropped in that window leave
+		// nothing stale behind.
+		sampleClientState(currentState());
 	}
 
 	@Subscribe
@@ -280,9 +309,8 @@ public class FacetteTelemetryPlugin extends Plugin
 	 * @return true when the client is in a live logged-in session, so callers needing that
 	 *         condition reuse this one definition rather than restating it
 	 */
-	private boolean sampleClientState()
+	private boolean sampleClientState(TelemetryState state)
 	{
-		TelemetryState state = currentState();
 		if (state == null)
 		{
 			return false;
@@ -322,7 +350,7 @@ public class FacetteTelemetryPlugin extends Plugin
 	 * as a first observation and never exported. Seeding costs one read per skill, once per
 	 * start, and reports nothing.
 	 *
-	 * <p>Only called when {@link #sampleClientState()} reports a live session, so the totals
+	 * <p>Only called when {@link #sampleClientState(TelemetryState)} reports a live session, so the totals
 	 * read here belong to a real logged-in character rather than an empty or half-loaded one.
 	 */
 	private void seedXpBaselines(TelemetryState state)
@@ -416,11 +444,22 @@ public class FacetteTelemetryPlugin extends Plugin
 		TelemetrySnapshot snapshot = publishingState.nextSnapshot(pluginActive);
 		try
 		{
-			int bytes = run.getWriter().write(snapshot);
+			// The authority check runs inside the writer, immediately before it replaces the
+			// target — not here, where a slow write could make the answer stale before it
+			// mattered. A run that lost authority while staging throws below.
+			int bytes = run.getWriter().write(snapshot, run::isCommitAuthorized);
 			// The sequence advances only for a snapshot that actually reached the file, and
 			// only on the state that issued it.
 			publishingState.recordPublished();
 			log.debug("Published telemetry snapshot seq={} ({} bytes)", snapshot.getSeq(), bytes);
+		}
+		catch (TelemetrySnapshotWriter.CommitNotAuthorizedException e)
+		{
+			// Expected whenever a newer run started while this one was writing — the staged
+			// file has been discarded and the target left alone. Not a failure, and not worth
+			// a warning; the sequence and bookkeeping are untouched because recordPublished
+			// was skipped.
+			log.debug("Abandoned a telemetry snapshot superseded by a newer plugin run");
 		}
 		catch (IOException e)
 		{
