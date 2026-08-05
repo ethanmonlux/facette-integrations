@@ -36,6 +36,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileTime;
 import java.util.Objects;
+import java.util.concurrent.locks.Lock;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 
@@ -146,16 +147,24 @@ final class TelemetrySnapshotWriter
 	 * what lets a publication that staged slowly discover, before it does any damage, that a
 	 * newer run has taken over.
 	 *
-	 * @param commitAuthorized evaluated once, immediately before target replacement. When it
-	 *                         reports false the staged file is deleted and the target is left
-	 *                         exactly as it was.
+	 * @param commitLock       held across the authorization check and the replacement only,
+	 *                         never across staging. Serializing the commit is what stops a
+	 *                         retired run's final write from being authorized and then having
+	 *                         a newer run publish before its move lands; keeping staging out
+	 *                         of it is what stops a stalled write from blocking a newly
+	 *                         enabled run from publishing at all.
+	 * @param commitAuthorized evaluated under {@code commitLock}, immediately before target
+	 *                         replacement. When it reports false the staged file is deleted
+	 *                         and the target is left exactly as it was.
 	 * @return the number of UTF-8 bytes written
 	 * @throws SnapshotTooLargeException     if the serialized snapshot exceeds the size
 	 *                                       ceiling, in which case nothing is staged at all
 	 * @throws CommitNotAuthorizedException  if authorization was lost before replacement
 	 */
-	int write(TelemetrySnapshot snapshot, BooleanSupplier commitAuthorized) throws IOException
+	int write(TelemetrySnapshot snapshot, Lock commitLock, BooleanSupplier commitAuthorized)
+		throws IOException
 	{
+		Objects.requireNonNull(commitLock, "commitLock");
 		Objects.requireNonNull(commitAuthorized, "commitAuthorized");
 		byte[] payload = snapshot.toJsonBytes();
 		if (payload.length > MAX_SNAPSHOT_BYTES)
@@ -180,14 +189,26 @@ final class TelemetrySnapshotWriter
 				channel.force(true);
 			}
 
-			// The staged file is complete and durable. This is the last moment at which
-			// abandoning it costs nothing, so it is where authority is confirmed.
-			if (!commitAuthorized.getAsBoolean())
+			// The staged file is complete and durable, and none of that work held the lock.
+			// Only the decision and the move are serialized, so a publication that stalls
+			// while staging delays nobody else.
+			commitLock.lock();
+			try
 			{
-				throw new CommitNotAuthorizedException(target);
-			}
+				// The last moment at which abandoning costs nothing, and — because the lock is
+				// held from here through the move — the answer cannot go stale before the
+				// target is replaced.
+				if (!commitAuthorized.getAsBoolean())
+				{
+					throw new CommitNotAuthorizedException(target);
+				}
 
-			replaceTarget(temp);
+				replaceTarget(temp);
+			}
+			finally
+			{
+				commitLock.unlock();
+			}
 			return payload.length;
 		}
 		finally

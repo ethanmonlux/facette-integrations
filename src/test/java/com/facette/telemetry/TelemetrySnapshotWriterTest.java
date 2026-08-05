@@ -36,6 +36,7 @@ import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -137,7 +138,7 @@ public class TelemetrySnapshotWriterTest
 		assertFalse(Files.exists(directory));
 
 		TelemetrySnapshot snapshot = snapshot(0L, "LOGIN_SCREEN");
-		int written = writer.write(snapshot, ALWAYS);
+		int written = writer.write(snapshot, new ReentrantLock(), ALWAYS);
 
 		Path target = directory.resolve(TelemetrySnapshotWriter.TARGET_FILE_NAME);
 		assertEquals(target, writer.getTarget());
@@ -152,10 +153,10 @@ public class TelemetrySnapshotWriterTest
 	public void replacesAnExistingTargetCompletely() throws IOException
 	{
 		TelemetrySnapshotWriter writer = new TelemetrySnapshotWriter(directory);
-		writer.write(snapshot(0L, "LOGIN_SCREEN"), ALWAYS);
+		writer.write(snapshot(0L, "LOGIN_SCREEN"), new ReentrantLock(), ALWAYS);
 
 		TelemetrySnapshot second = snapshot(1L, "LOGGED_IN");
-		writer.write(second, ALWAYS);
+		writer.write(second, new ReentrantLock(), ALWAYS);
 
 		Path target = directory.resolve(TelemetrySnapshotWriter.TARGET_FILE_NAME);
 		assertArrayEquals(second.toJsonBytes(), Files.readAllBytes(target));
@@ -169,7 +170,7 @@ public class TelemetrySnapshotWriterTest
 	{
 		RecordingMover mover = new RecordingMover();
 		TelemetrySnapshotWriter writer = new TelemetrySnapshotWriter(directory, mover, () -> NOW);
-		writer.write(snapshot(0L, "LOGGED_IN"), ALWAYS);
+		writer.write(snapshot(0L, "LOGGED_IN"), new ReentrantLock(), ALWAYS);
 
 		assertEquals(1, mover.attempts.size());
 		assertTrue(mover.attempts.get(0).contains(StandardCopyOption.ATOMIC_MOVE));
@@ -183,9 +184,9 @@ public class TelemetrySnapshotWriterTest
 		mover.refuseAtomicMove = true;
 		TelemetrySnapshotWriter writer = new TelemetrySnapshotWriter(directory, mover, () -> NOW);
 
-		writer.write(snapshot(0L, "LOGIN_SCREEN"), ALWAYS);
+		writer.write(snapshot(0L, "LOGIN_SCREEN"), new ReentrantLock(), ALWAYS);
 		TelemetrySnapshot second = snapshot(1L, "LOGGED_IN");
-		writer.write(second, ALWAYS);
+		writer.write(second, new ReentrantLock(), ALWAYS);
 
 		// Two publications, each attempting atomic first and then falling back.
 		assertEquals(4, mover.attempts.size());
@@ -202,7 +203,7 @@ public class TelemetrySnapshotWriterTest
 	{
 		TelemetrySnapshotWriter writer = new TelemetrySnapshotWriter(directory);
 		TelemetrySnapshot good = snapshot(0L, "LOGGED_IN");
-		writer.write(good, ALWAYS);
+		writer.write(good, new ReentrantLock(), ALWAYS);
 
 		StringBuilder oversized = new StringBuilder();
 		for (int i = 0; i < TelemetrySnapshotWriter.MAX_SNAPSHOT_BYTES + 1; i++)
@@ -212,7 +213,7 @@ public class TelemetrySnapshotWriterTest
 
 		try
 		{
-			writer.write(snapshot(1L, oversized.toString()), ALWAYS);
+			writer.write(snapshot(1L, oversized.toString()), new ReentrantLock(), ALWAYS);
 			fail("expected an oversized snapshot to be refused");
 		}
 		catch (TelemetrySnapshotWriter.SnapshotTooLargeException expected)
@@ -241,7 +242,7 @@ public class TelemetrySnapshotWriterTest
 
 		TelemetrySnapshot exact = snapshot(0L, padding.toString());
 		assertEquals(TelemetrySnapshotWriter.MAX_SNAPSHOT_BYTES, exact.toJsonBytes().length);
-		assertEquals(TelemetrySnapshotWriter.MAX_SNAPSHOT_BYTES, writer.write(exact, ALWAYS));
+		assertEquals(TelemetrySnapshotWriter.MAX_SNAPSHOT_BYTES, writer.write(exact, new ReentrantLock(), ALWAYS));
 	}
 
 	@Test
@@ -253,7 +254,7 @@ public class TelemetrySnapshotWriterTest
 
 		try
 		{
-			writer.write(snapshot(0L, "LOGGED_IN"), ALWAYS);
+			writer.write(snapshot(0L, "LOGGED_IN"), new ReentrantLock(), ALWAYS);
 			fail("expected the replacement failure to propagate");
 		}
 		catch (IOException expected)
@@ -281,7 +282,7 @@ public class TelemetrySnapshotWriterTest
 
 		TelemetrySnapshotWriter writer =
 			new TelemetrySnapshotWriter(directory, Files::move, () -> NOW);
-		writer.write(snapshot(0L, "LOGGED_IN"), ALWAYS);
+		writer.write(snapshot(0L, "LOGGED_IN"), new ReentrantLock(), ALWAYS);
 
 		assertFalse("an abandoned temporary file should be removed", Files.exists(abandoned));
 		assertTrue("another client's in-flight file must be left alone", Files.exists(recent));
@@ -293,13 +294,13 @@ public class TelemetrySnapshotWriterTest
 	{
 		TelemetrySnapshotWriter writer = new TelemetrySnapshotWriter(directory);
 		TelemetrySnapshot good = snapshot(0L, "LOGGED_IN");
-		writer.write(good, ALWAYS);
+		writer.write(good, new ReentrantLock(), ALWAYS);
 
 		// A newer run took over while this publication was staging.
 		TelemetrySnapshot superseded = snapshot(1L, "LOGIN_SCREEN");
 		try
 		{
-			writer.write(superseded, () -> false);
+			writer.write(superseded, new ReentrantLock(), () -> false);
 			fail("expected an unauthorized commit to be refused");
 		}
 		catch (TelemetrySnapshotWriter.CommitNotAuthorizedException expected)
@@ -323,7 +324,7 @@ public class TelemetrySnapshotWriterTest
 
 		try
 		{
-			writer.write(snapshot(0L, "LOGGED_IN"), () ->
+			writer.write(snapshot(0L, "LOGGED_IN"), new ReentrantLock(), () ->
 			{
 				try
 				{
@@ -352,10 +353,10 @@ public class TelemetrySnapshotWriterTest
 	public void anAuthorizedCommitStillReplacesTheTarget() throws IOException
 	{
 		TelemetrySnapshotWriter writer = new TelemetrySnapshotWriter(directory);
-		writer.write(snapshot(0L, "LOGGED_IN"), ALWAYS);
+		writer.write(snapshot(0L, "LOGGED_IN"), new ReentrantLock(), ALWAYS);
 
 		TelemetrySnapshot inactive = snapshot(1L, "LOGIN_SCREEN");
-		assertEquals(inactive.toJsonBytes().length, writer.write(inactive, () -> true));
+		assertEquals(inactive.toJsonBytes().length, writer.write(inactive, new ReentrantLock(), () -> true));
 		assertArrayEquals(inactive.toJsonBytes(),
 			Files.readAllBytes(directory.resolve(TelemetrySnapshotWriter.TARGET_FILE_NAME)));
 	}

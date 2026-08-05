@@ -102,9 +102,12 @@ public class FacetteTelemetryPlugin extends Plugin
 	private ClientThread clientThread;
 
 	/**
-	 * Serializes publications across runs. Within a run the single publisher thread already
-	 * orders them; this matters when a retired run's final write and a new run's publisher
-	 * are alive at the same time, on different threads.
+	 * Serializes the <em>commit</em> step of publications across runs — the authority check and
+	 * the target replacement, nothing else. Within a run the single publisher thread already
+	 * orders publications; this matters when a retired run's final write and a new run's
+	 * publisher are alive at the same time, on different threads, and it is what stops a
+	 * retired run from being authorized and then having a newer run's snapshot overwritten by
+	 * its move. Staging is deliberately outside it, so a stalled write delays nobody.
 	 */
 	private final ReentrantLock publishLock = new ReentrantLock();
 
@@ -189,14 +192,19 @@ public class FacetteTelemetryPlugin extends Plugin
 			thread.setDaemon(true);
 			return thread;
 		});
-		// The task is bound to this run for its whole life. It never reads a field, so a later
-		// start cannot redirect it at a newer run's state or writer.
-		// A zero initial delay publishes the active snapshot as soon as the plugin starts.
 		// Adopted before anything is scheduled on it. The first tick has a zero initial delay
 		// and can run before scheduleWithFixedDelay even returns, so a disable landing in that
 		// gap has to find a publisher to stop — otherwise the executor leaks and the run ends
 		// with no final snapshot while a tick already in flight commits an active one.
-		run.attachPublisher(executor);
+		if (!run.attachPublisherIfCurrent(executor))
+		{
+			// Disabled while this callback was sampling and seeding. Shutdown has already run
+			// and found no publisher to stop, so nothing else will ever dispose of this
+			// executor — do it here rather than leak a thread per disable/re-enable.
+			executor.shutdownNow();
+			log.debug("Run was retired during startup; publisher discarded");
+			return;
+		}
 		try
 		{
 			// The task is bound to this run for its whole life. It never reads a field, so a
@@ -419,11 +427,10 @@ public class FacetteTelemetryPlugin extends Plugin
 	/**
 	 * One scheduled publication attempt, permanently bound to the run that scheduled it.
 	 *
-	 * <p>The run is checked twice on purpose. Once before contending for the lock, so a
-	 * retired run does not queue behind a shutdown write it has no business completing. Once
-	 * again after acquiring it, because the interesting case is the task that was *already*
-	 * waiting when its run was disabled: by the time it wins the lock the plugin may have
-	 * been re-enabled, and only the second check can see that.
+	 * <p>A retired run stops here rather than doing the work of building and staging a snapshot
+	 * it would not be allowed to commit. This check is an optimization, not the safeguard: a
+	 * run retired after it passes still cannot land on a newer run's file, because the writer
+	 * re-checks commit authority under the lock immediately before replacing the target.
 	 */
 	private void publishTick(PublisherRunContext run)
 	{
@@ -431,9 +438,8 @@ public class FacetteTelemetryPlugin extends Plugin
 		{
 			return;
 		}
-		// The lock is taken inside publish(), which is also where the commit decision is made,
-		// so the due-check does not need it. A change landing between here and there only
-		// costs a redundant publication.
+		// No lock is needed for the due-check: the commit decision is made later, inside the
+		// writer. A change landing between here and there only costs a redundant publication.
 		if (run.getState().isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
 		{
 			publish(run, true);
@@ -441,54 +447,46 @@ public class FacetteTelemetryPlugin extends Plugin
 	}
 
 	/**
-	 * Publishes one snapshot through the run that owns it. Callers must hold
-	 * {@link #publishLock}.
+	 * Publishes one snapshot through the run that owns it.
 	 *
 	 * <p>Everything this touches comes from {@code run}, so a publication can only ever reach
 	 * the state, writer, sequence, and bookkeeping of the run that issued it — never a later
 	 * one's, whatever the interleaving.
+	 *
+	 * <p>{@link #publishLock} is not held across this method. It is handed to the writer, which
+	 * takes it only across the authorization check and the target replacement — the pair that
+	 * has to be indivisible — and never across staging. Holding it through staging would let
+	 * one run's stalled write block a newly enabled run from publishing or heartbeating at all,
+	 * which is a worse failure than the one the lock exists to prevent.
 	 */
 	private void publish(PublisherRunContext run, boolean pluginActive)
 	{
-		// Held across build, authorization, and target replacement — not merely around the
-		// decision to publish. Authorization and the move have to be one indivisible step: a
-		// retired run's final write could otherwise be authorized, then have a newer run
-		// publish, then complete its move and bury that newer snapshot under an inactive one.
-		// Every publication path goes through here, so no caller can forget to take it.
-		publishLock.lock();
+		TelemetryState publishingState = run.getState();
+		TelemetrySnapshot snapshot = publishingState.nextSnapshot(pluginActive);
 		try
 		{
-			TelemetryState publishingState = run.getState();
-			TelemetrySnapshot snapshot = publishingState.nextSnapshot(pluginActive);
-			try
-			{
-				// The authority check runs inside the writer, immediately before it replaces the
-				// target — not here, where a slow write could make the answer stale before it
-				// mattered. A run that lost authority while staging throws below.
-				int bytes = run.getWriter().write(snapshot, run::isCommitAuthorized);
-				// The sequence advances only for a snapshot that actually reached the file, and
-				// only on the state that issued it.
-				publishingState.recordPublished();
-				log.debug("Published telemetry snapshot seq={} ({} bytes)", snapshot.getSeq(), bytes);
-			}
-			catch (TelemetrySnapshotWriter.CommitNotAuthorizedException e)
-			{
-				// Expected whenever a newer run started while this one was writing — the staged
-				// file has been discarded and the target left alone. Not a failure, and not worth
-				// a warning; the sequence and bookkeeping are untouched because recordPublished
-				// was skipped.
-				log.debug("Abandoned a telemetry snapshot superseded by a newer plugin run");
-			}
-			catch (IOException e)
-			{
-				// Logged without the payload, and without advancing the sequence: the next
-				// publication retries the same sequence number.
-				log.warn("Unable to publish telemetry snapshot to {}", run.getWriter().getTarget(), e);
-			}
+			// The authority check runs inside the writer, immediately before it replaces the
+			// target — not here, where a slow write could make the answer stale before it
+			// mattered. A run that lost authority while staging throws below.
+			int bytes = run.getWriter().write(snapshot, publishLock, run::isCommitAuthorized);
+			// The sequence advances only for a snapshot that actually reached the file, and
+			// only on the state that issued it.
+			publishingState.recordPublished();
+			log.debug("Published telemetry snapshot seq={} ({} bytes)", snapshot.getSeq(), bytes);
 		}
-		finally
+		catch (TelemetrySnapshotWriter.CommitNotAuthorizedException e)
 		{
-			publishLock.unlock();
+			// Expected whenever a newer run started while this one was writing — the staged
+			// file has been discarded and the target left alone. Not a failure, and not worth
+			// a warning; the sequence and bookkeeping are untouched because recordPublished
+			// was skipped.
+			log.debug("Abandoned a telemetry snapshot superseded by a newer plugin run");
+		}
+		catch (IOException e)
+		{
+			// Logged without the payload, and without advancing the sequence: the next
+			// publication retries the same sequence number.
+			log.warn("Unable to publish telemetry snapshot to {}", run.getWriter().getTarget(), e);
 		}
 	}
 

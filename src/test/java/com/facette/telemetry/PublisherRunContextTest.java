@@ -92,7 +92,7 @@ public class PublisherRunContextTest
 	private static void publish(PublisherRunContext run, boolean pluginActive) throws IOException
 	{
 		TelemetrySnapshot snapshot = run.getState().nextSnapshot(pluginActive);
-		run.getWriter().write(snapshot, run::isCommitAuthorized);
+		run.getWriter().write(snapshot, new ReentrantLock(), run::isCommitAuthorized);
 		run.getState().recordPublished();
 	}
 
@@ -289,7 +289,7 @@ public class PublisherRunContextTest
 			try
 			{
 				TelemetrySnapshot inactive = runA.getState().nextSnapshot(false);
-				runA.getWriter().write(inactive, () ->
+				runA.getWriter().write(inactive, new ReentrantLock(), () ->
 				{
 					// Stand at the commit boundary until Run B has published, then answer
 					// truthfully. This is the exact interleaving, forced deterministically.
@@ -325,7 +325,7 @@ public class PublisherRunContextTest
 		PublisherRunContext runB = new RunBuilder(shared).build();
 		runB.getState().updateSession("LOGGED_IN", true);
 		TelemetrySnapshot active = runB.getState().nextSnapshot(true);
-		runB.getWriter().write(active, runB::isCommitAuthorized);
+		runB.getWriter().write(active, new ReentrantLock(), runB::isCommitAuthorized);
 		runBPublished.countDown();
 
 		runAFinalWrite.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
@@ -370,7 +370,7 @@ public class PublisherRunContextTest
 			t.setDaemon(true);
 			return t;
 		});
-		run.attachPublisher(executor);
+		run.attachPublisherIfCurrent(executor);
 		run.attachPublishTask(executor.scheduleWithFixedDelay(
 			() -> { }, 1L, 1L, TimeUnit.HOURS));
 
@@ -412,7 +412,7 @@ public class PublisherRunContextTest
 			t.setDaemon(true);
 			return t;
 		});
-		run.attachPublisher(executor);
+		run.attachPublisherIfCurrent(executor);
 		run.attachPublishTask(executor.scheduleWithFixedDelay(
 			() -> { }, 1L, 1L, TimeUnit.HOURS));
 		assertTrue(run.hasPublisher());
@@ -445,7 +445,7 @@ public class PublisherRunContextTest
 		});
 
 		// Adoption happens first, with no task yet — exactly the window the ordering closes.
-		run.attachPublisher(executor);
+		run.attachPublisherIfCurrent(executor);
 		assertTrue("shutdown must be able to find the executor immediately", run.hasPublisher());
 
 		AtomicBoolean finalWriteRan = new AtomicBoolean(false);
@@ -462,7 +462,7 @@ public class PublisherRunContextTest
 	 * This drives that interleaving and asserts the shared publication lock prevents it.
 	 */
 	@Test
-	public void theCommitLockKeepsAnOldFinalWriteFromBuryingANewerPublication() throws Exception
+	public void aStalledOldWriteNeitherBlocksNorBuriesANewerPublication() throws Exception
 	{
 		ReentrantLock publishLock = new ReentrantLock();
 		Path shared = folder.getRoot().toPath().resolve("locked");
@@ -476,13 +476,14 @@ public class PublisherRunContextTest
 		// the discipline the plugin's publish() now enforces for every publication path.
 		Thread runAFinalWrite = new Thread(() ->
 		{
-			publishLock.lock();
 			try
 			{
+				// Staging is deliberately outside the commit lock now, so this thread parks
+				// where a stalled write would: holding nothing another run needs.
 				runAInsideTheLock.countDown();
 				runAMayFinish.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 				runA.getWriter().write(
-					runA.getState().nextSnapshot(false), runA::isCommitAuthorized);
+					runA.getState().nextSnapshot(false), publishLock, runA::isCommitAuthorized);
 			}
 			catch (TelemetrySnapshotWriter.CommitNotAuthorizedException expected)
 			{
@@ -495,10 +496,6 @@ public class PublisherRunContextTest
 			catch (InterruptedException e)
 			{
 				Thread.currentThread().interrupt();
-			}
-			finally
-			{
-				publishLock.unlock();
 			}
 		}, "run-a-final-write");
 
@@ -513,30 +510,29 @@ public class PublisherRunContextTest
 		AtomicBoolean runBPublished = new AtomicBoolean(false);
 		Thread runBPublish = new Thread(() ->
 		{
-			publishLock.lock();
 			try
 			{
-				runB.getWriter().write(runB.getState().nextSnapshot(true), runB::isCommitAuthorized);
+				runB.getWriter().write(
+					runB.getState().nextSnapshot(true), publishLock, runB::isCommitAuthorized);
 				runBPublished.set(true);
 			}
 			catch (IOException e)
 			{
 				throw new IllegalStateException(e);
 			}
-			finally
-			{
-				publishLock.unlock();
-			}
 		}, "run-b-publish");
 		runBPublish.start();
-		awaitQueuedOnLock(publishLock);
+
+		// Run B must NOT be blocked by Run A's parked staging — that is the liveness property
+		// this narrower lock buys. It publishes while Run A is still stuck.
+		runBPublish.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+		assertTrue("a newer run must publish even while an older one is stalled staging",
+			runBPublished.get());
 
 		runAMayFinish.countDown();
 		runAFinalWrite.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
-		runBPublish.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
 		assertFalse(runAFinalWrite.isAlive());
 		assertFalse(runBPublish.isAlive());
-		assertTrue("Run B must have published", runBPublished.get());
 
 		// Whichever order the lock granted, the file ends as Run B's active snapshot: Run A
 		// either committed first and was replaced, or was refused for lack of authority.
@@ -545,6 +541,51 @@ public class PublisherRunContextTest
 		assertTrue("the newest run's active snapshot must be what survives",
 			onDisk.contains("\"pluginActive\":true"));
 		assertTrue(onDisk.contains(runB.getState().getInstanceId()));
+	}
+
+	/**
+	 * Startup samples and seeds before it attaches a publisher, which is long enough for a
+	 * disable to land in between. Shutdown will already have decided there was no publisher to
+	 * stop, so adopting the executor at that point would leak it — no later shutdown can reach
+	 * it once a re-enable replaces the current run.
+	 */
+	@Test
+	public void aRetiredRunRefusesToAdoptAPublisher()
+	{
+		PublisherRunContext run = newRun();
+
+		// The disable lands while startup is still sampling and seeding.
+		run.retire();
+
+		ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r ->
+		{
+			Thread t = new Thread(r, "late-publisher");
+			t.setDaemon(true);
+			return t;
+		});
+		assertFalse("a retired run must not adopt a publisher",
+			run.attachPublisherIfCurrent(executor));
+		assertFalse("and must not report one", run.hasPublisher());
+
+		// The caller owns the executor it was refused, and shutting it down is what prevents
+		// the leaked daemon thread per disable/re-enable toggle.
+		executor.shutdownNow();
+		assertTrue(executor.isShutdown());
+	}
+
+	@Test
+	public void aCurrentRunStillAdoptsItsPublisher()
+	{
+		PublisherRunContext run = newRun();
+		ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r ->
+		{
+			Thread t = new Thread(r, "publisher");
+			t.setDaemon(true);
+			return t;
+		});
+		assertTrue(run.attachPublisherIfCurrent(executor));
+		assertTrue(run.hasPublisher());
+		run.abandonPublisher();
 	}
 
 	/** Builds runs that share one target directory, for cross-run file-contention tests. */

@@ -123,9 +123,10 @@ final class PublisherRunContext
 	/**
 	 * Whether work bound to this run may still act.
 	 *
-	 * <p>Checked when a deferred startup callback finally runs, before contending for the
-	 * publication lock, and again after acquiring it — the windows where a run can be
-	 * disabled while its work is already scheduled or waiting.
+	 * <p>Checked when a deferred startup callback finally runs, when it goes to attach a
+	 * publisher, and at the top of each periodic tick — the points where a run can already have
+	 * been disabled while its work was scheduled or in flight. It is not what protects the
+	 * target file; {@link #isCommitAuthorized()} is.
 	 */
 	boolean isCurrent()
 	{
@@ -137,7 +138,7 @@ final class PublisherRunContext
 	 *
 	 * @return true if this call retired the run, false if it was already retired
 	 */
-	boolean retire()
+	synchronized boolean retire()
 	{
 		return current.compareAndSet(true, false);
 	}
@@ -177,10 +178,26 @@ final class PublisherRunContext
 	 * disable landing in the gap would find nothing to stop, leak the executor, and skip the
 	 * final snapshot. From this call onward the run owns the thread and shutdown can always
 	 * reach it.
+	 *
+	 * <p>Refuses once the run is retired, and does so atomically with {@link #retire()} — both
+	 * are synchronized on this context. Startup samples and seeds before it gets here, which
+	 * takes long enough for a disable to land in between, and shutdown will already have
+	 * decided there was no publisher to stop. Handing the executor to a retired run in that
+	 * window would leak it: no later shutdown can reach it once a re-enable replaces the
+	 * current run. Either retirement wins and the caller disposes of the executor, or this
+	 * wins and shutdown is guaranteed to find it.
+	 *
+	 * @return false if the run was already retired, in which case it did not adopt the
+	 *         executor and the caller must shut it down
 	 */
-	synchronized void attachPublisher(ExecutorService executor)
+	synchronized boolean attachPublisherIfCurrent(ExecutorService executor)
 	{
+		if (!current.get())
+		{
+			return false;
+		}
 		this.executor = executor;
+		return true;
 	}
 
 	/**
