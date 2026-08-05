@@ -215,11 +215,11 @@ public class FacetteTelemetryPlugin extends Plugin
 	public void onGameStateChanged(GameStateChanged gameStateChanged)
 	{
 		GameState gameState = gameStateChanged.getGameState();
-		if (endsSession(gameState))
-		{
-			state.endSession();
-		}
-		state.updateSession(gameState.name(), gameState == GameState.LOGGED_IN);
+		// One atomic transition. Applied as two calls, a publication could slip between them
+		// and observe the experience baselines already discarded while the session still read
+		// as live and still carried the previous world, vitals, and inventory.
+		state.updateSession(
+			gameState.name(), gameState == GameState.LOGGED_IN, endsSession(gameState));
 	}
 
 	@Subscribe

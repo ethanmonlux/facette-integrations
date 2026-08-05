@@ -121,6 +121,25 @@ final class TelemetryState
 	 */
 	synchronized void updateSession(String gameStateName, boolean nowLoggedIn)
 	{
+		updateSession(gameStateName, nowLoggedIn, false);
+	}
+
+	/**
+	 * Applies a client game-state transition as one atomic step.
+	 *
+	 * <p>Ending the session is folded in here rather than exposed as a second call, because
+	 * two separately synchronized calls leave a window the publisher can be released into:
+	 * discarding the experience baselines marks the state dirty, so a publication could
+	 * observe cleared experience while the session still read as live and still carried the
+	 * previous world, vitals, and inventory. One transition makes that unobservable by
+	 * construction rather than by the caller happening to order the two correctly.
+	 *
+	 * @param sessionEnded whether reaching this state ends the play session, discarding the
+	 *                     session-local experience baselines so a later login cannot inherit
+	 *                     a previous session's comparison and report a fabricated gain
+	 */
+	synchronized void updateSession(String gameStateName, boolean nowLoggedIn, boolean sessionEnded)
+	{
 		String name = gameStateName == null ? UNKNOWN_GAME_STATE : gameStateName;
 		markIfChanged(gameState, name);
 		markIfChanged(loggedIn, nowLoggedIn);
@@ -131,19 +150,15 @@ final class TelemetryState
 		{
 			clearPlayerDerived();
 		}
-	}
 
-	/**
-	 * Discards the session-local experience baselines so a later login cannot inherit a
-	 * previous session's comparison and report a fabricated gain.
-	 */
-	synchronized void endSession()
-	{
-		xpBaselines.clear();
-		markIfChanged(lastSkill, null);
-		lastSkill = null;
-		lastDelta = null;
-		lastChangedAt = null;
+		if (sessionEnded)
+		{
+			xpBaselines.clear();
+			markIfChanged(lastSkill, null);
+			lastSkill = null;
+			lastDelta = null;
+			lastChangedAt = null;
+		}
 	}
 
 	synchronized void updateWorld(Integer newWorld)

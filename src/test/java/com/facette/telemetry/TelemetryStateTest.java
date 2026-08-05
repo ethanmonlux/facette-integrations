@@ -208,6 +208,56 @@ public class TelemetryStateTest
 		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
 	}
 
+	/**
+	 * A session-ending transition must be a single state change, not a clear followed by a
+	 * logout. Applied as two steps, a publication can observe the experience baselines
+	 * already discarded while the session still reads as live and still carries the previous
+	 * world, vitals, and inventory — a half-transitioned snapshot no real session produces.
+	 */
+	@Test
+	public void aSessionEndingTransitionIsAppliedAtomically()
+	{
+		logIn();
+		state.updateWorld(302);
+		state.updateVitals(73, 75, 40, 52, 8_800);
+		state.updateInventory(12);
+		state.observeXp("FISHING", 10_000);
+		state.observeXp("FISHING", 10_050);
+
+		state.updateSession("LOGIN_SCREEN", false, true);
+
+		// There is no observable point between "baselines cleared" and "logged out": the
+		// very next snapshot is already fully logged out with nothing player-derived left.
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("false", value(json, "loggedIn"));
+		assertEquals("\"LOGIN_SCREEN\"", value(json, "gameState"));
+		for (String key : new String[]{"world", "hitpointsCurrent", "prayerCurrent",
+			"runEnergyPercent", "usedSlots", "freeSlots", "lastSkill", "lastDelta", "lastChangedAt"})
+		{
+			assertEquals(key + " should be null the moment the session ends", "null", value(json, key));
+		}
+
+		// And the baselines really were discarded by that same call.
+		logIn();
+		assertFalse("the next login's first reading must seed, not report a gain",
+			state.observeXp("FISHING", 50_000));
+	}
+
+	@Test
+	public void aNonSessionEndingTransitionKeepsTheBaselines()
+	{
+		logIn();
+		state.observeXp("FISHING", 10_000);
+
+		// A world hop leaves the logged-in state without ending the session.
+		state.updateSession("HOPPING", false, false);
+		logIn();
+
+		assertTrue("a hop must not re-seed and swallow the next gain",
+			state.observeXp("FISHING", 10_040));
+		assertEquals("40", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
 	@Test
 	public void endingASessionClearsBaselinesSoALaterLoginCannotInheritADelta()
 	{
@@ -216,8 +266,7 @@ public class TelemetryStateTest
 		state.observeXp("FISHING", 10_050);
 		assertEquals("\"fishing\"", value(state.nextSnapshot(true).toJson(), "lastSkill"));
 
-		state.endSession();
-		state.updateSession("LOGIN_SCREEN", false);
+		state.updateSession("LOGIN_SCREEN", false, true);
 		logIn();
 
 		// The next login's very first observation is a fresh baseline, not a 40k gain.
