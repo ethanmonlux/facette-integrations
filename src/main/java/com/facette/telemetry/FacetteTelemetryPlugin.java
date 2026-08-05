@@ -163,15 +163,14 @@ public class FacetteTelemetryPlugin extends Plugin
 
 		try
 		{
-			if (sampleClientState(run.getState()))
-			{
-				seedXpBaselines(run.getState());
-			}
-			// Anything seeding did not consume — in practice a startup that found no live
-			// session — is dropped here rather than left to influence a later seed.
-			run.getState().discardPreInitialXp();
-			// Only now may anything publish: the state has been sampled and the experience
-			// baselines seeded, so no snapshot can be built from a partly initialized run.
+			// Seeding is folded into the sample rather than performed here, so that a callback
+			// landing during a world hop or loading screen — where there is no live session to
+			// read totals from — leaves the seeding to the first live sample instead of
+			// skipping it for the whole run. Retained totals are likewise not discarded here;
+			// they have to survive until that sample.
+			sampleClientState(run.getState());
+			// Only now may anything publish: the state has been sampled, so no snapshot can be
+			// built from a partly initialized run.
 			run.markInitialized();
 			startPublisher(run);
 		}
@@ -404,6 +403,17 @@ public class FacetteTelemetryPlugin extends Plugin
 			return false;
 		}
 
+		// The first live sample of a session establishes its experience baselines, whether that
+		// is the one taken during startup or a later one after a hop or loading screen. Reading
+		// the totals on a tick rather than on the logged-in transition also means skill data is
+		// loaded, so a transient zero cannot become a baseline and fabricate a gain the size of
+		// the whole skill when the real total arrives.
+		if (state.needsXpBaselineSeeding())
+		{
+			seedXpBaselines(state);
+			state.markXpBaselinesSeeded();
+		}
+
 		state.updateWorld(client.getWorld());
 		state.updateVitals(
 			client.getBoostedSkillLevel(Skill.HITPOINTS),
@@ -428,10 +438,17 @@ public class FacetteTelemetryPlugin extends Plugin
 	 * <p>In that case RuneLite's login-time experience events fired before the plugin was
 	 * running, so nothing has filled the baselines and the next real gain would be consumed
 	 * as a first observation and never exported. Seeding costs one read per skill, once per
-	 * start, and reports nothing.
+	 * session, and reports nothing by itself.
 	 *
-	 * <p>Only called when {@link #sampleClientState(TelemetryState)} reports a live session, so the totals
+	 * <p>Called from the first live sample of a session rather than from startup — see
+	 * {@link TelemetryState#needsXpBaselineSeeding()} for why tying it to startup left a
+	 * callback that landed mid-hop with no baselines at all. Reached only once
+	 * {@link #sampleClientState(TelemetryState)} has established a live session, so the totals
 	 * read here belong to a real logged-in character rather than an empty or half-loaded one.
+	 *
+	 * <p>Where {@link TelemetryState#recordPreInitialXp(String, int)} retained an earlier total
+	 * for a skill, seeding measures against that instead and exports the difference, so
+	 * experience earned while startup was still queued is not absorbed.
 	 */
 	private void seedXpBaselines(TelemetryState state)
 	{

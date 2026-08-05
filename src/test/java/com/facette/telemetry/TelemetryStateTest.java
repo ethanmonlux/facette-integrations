@@ -652,6 +652,98 @@ public class TelemetryStateTest
 		assertEquals("null", value(json, "lastDelta"));
 	}
 
+	/**
+	 * The defect this fixes: seeding used to happen once, in the startup callback, and only if
+	 * that callback happened to land on a live session. Landing during a world hop or loading
+	 * screen left the whole run with no baselines, so the next genuine gain was consumed as a
+	 * first observation — the same loss the mid-session seeding fix exists to prevent.
+	 */
+	@Test
+	public void aSessionThatStartedMidHopStillSeedsOnceItGoesLive()
+	{
+		// Startup lands during a loading screen: nothing to seed from.
+		state.updateSession("LOADING", false);
+		assertFalse("no seeding is possible without a live session", state.needsXpBaselineSeeding());
+
+		// The hop completes. The next live sample is what establishes the baselines.
+		logIn();
+		assertTrue("the first live sample must seed", state.needsXpBaselineSeeding());
+		assertTrue(state.seedXpBaseline("AGILITY", 50_000));
+		state.markXpBaselinesSeeded();
+
+		assertFalse("seeding happens once per session, not every sample",
+			state.needsXpBaselineSeeding());
+
+		// The first genuine gain after the hop is exported rather than consumed.
+		now = 1_770_000_005_000L;
+		assertTrue(state.observeXp("AGILITY", 50_120));
+		assertEquals("120", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void aTotalRetainedBeforeAHopSurvivesUntilTheSessionGoesLive()
+	{
+		// Experience lands while startup is queued, then startup completes mid-hop.
+		assertTrue(state.recordPreInitialXp("AGILITY", 50_000));
+		state.updateSession("LOADING", false);
+
+		// The retained total must not have been thrown away by initialization completing.
+		logIn();
+		assertTrue(state.needsXpBaselineSeeding());
+		now = 1_770_000_005_000L;
+		assertTrue(state.seedXpBaseline("AGILITY", 50_120));
+
+		assertEquals("the window's experience is still measured", "120",
+			value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void aWorldHopDoesNotCauseTheSessionToReseed()
+	{
+		logIn();
+		state.seedXpBaseline("AGILITY", 50_000);
+		state.markXpBaselinesSeeded();
+
+		// A hop is not a session boundary, so the established baselines still govern.
+		state.updateSession("LOADING", false);
+		state.updateSession("LOGGED_IN", true);
+		assertFalse("a hop must not re-read totals or reset the comparison",
+			state.needsXpBaselineSeeding());
+
+		now = 1_770_000_005_000L;
+		assertTrue(state.observeXp("AGILITY", 50_120));
+		assertEquals("120", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void aLogoutAndLoginInsideOneRunSeedsAgainRatherThanConsumingTheNextGain()
+	{
+		logIn();
+		state.seedXpBaseline("AGILITY", 50_000);
+		state.markXpBaselinesSeeded();
+
+		// Ending the session discards the baselines, so the next one must establish its own.
+		state.updateSession("LOGIN_SCREEN", false, true);
+		logIn();
+		assertTrue("a new session seeds again", state.needsXpBaselineSeeding());
+
+		assertTrue(state.seedXpBaseline("AGILITY", 60_000));
+		now = 1_770_000_005_000L;
+		assertTrue("the first gain after logging back in is exported", state.observeXp("AGILITY", 60_075));
+		assertEquals("75", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	@Test
+	public void seedingIsNotMarkedCompleteWhileLoggedOut()
+	{
+		state.updateSession("LOGIN_SCREEN", false);
+		state.markXpBaselinesSeeded();
+
+		logIn();
+		assertTrue("a logged-out mark must not suppress the real seeding",
+			state.needsXpBaselineSeeding());
+	}
+
 	@Test
 	public void experienceIsNotObservedWhileLoggedOut()
 	{

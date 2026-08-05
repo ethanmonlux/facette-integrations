@@ -83,6 +83,13 @@ final class TelemetryState
 	 */
 	private final Map<String, Integer> preInitialXp = new HashMap<>();
 
+	/**
+	 * Whether this session's experience baselines have been established from the client's live
+	 * totals. Reset when a session ends, so a later login seeds again rather than inheriting a
+	 * previous session's comparison.
+	 */
+	private boolean xpBaselinesSeeded;
+
 	private boolean dirty = true;
 
 	/** Monotonic counter incremented whenever a change marks the state dirty. */
@@ -176,6 +183,8 @@ final class TelemetryState
 			// A total observed during a startup that spanned a logout belongs to the session
 			// that ended, and must not become a later login's baseline.
 			preInitialXp.clear();
+			// The next live session seeds its own baselines rather than running without any.
+			xpBaselinesSeeded = false;
 			markIfChanged(lastSkill, null);
 			lastSkill = null;
 			lastDelta = null;
@@ -341,13 +350,49 @@ final class TelemetryState
 	}
 
 	/**
-	 * Drops any retained pre-initialization totals that seeding did not consume — in practice
-	 * a startup that found no live session to seed from. Nothing may carry into the initialized
-	 * run, which from then on gets its baselines from observations alone.
+	 * Drops any retained pre-initialization totals.
+	 *
+	 * <p>Called only when the totals can no longer refer to the session they were taken from —
+	 * a session ending during a startup that had not yet applied the transition. Deliberately
+	 * <em>not</em> called merely because initialization finished: a startup that completes
+	 * during a loading screen or world hop has no live session to seed from yet, and the totals
+	 * have to survive until the one that follows.
 	 */
 	synchronized void discardPreInitialXp()
 	{
 		preInitialXp.clear();
+	}
+
+	/**
+	 * Whether this session still needs its experience baselines established from the client's
+	 * live totals.
+	 *
+	 * <p>Seeding cannot be a one-shot performed at startup. The startup callback is deferred
+	 * onto the client thread and can land while the client is between states — a world hop, a
+	 * loading screen — where there is no live session to read totals from. Tying seeding to
+	 * that one moment means a callback that lands unluckily leaves the session with no
+	 * baselines at all, and the first genuine gain is then consumed as a first observation.
+	 * Asking on every live sample instead makes seeding happen at the first moment it can.
+	 *
+	 * <p>Also covers a logout and login inside one plugin run: ending the session clears the
+	 * baselines, and this is what causes the next live session to establish its own.
+	 */
+	synchronized boolean needsXpBaselineSeeding()
+	{
+		return loggedIn && !xpBaselinesSeeded;
+	}
+
+	/**
+	 * Records that this session's baselines have been seeded, so the client is not re-read on
+	 * every subsequent sample. Refused while logged out, where any totals read would not
+	 * belong to a live session.
+	 */
+	synchronized void markXpBaselinesSeeded()
+	{
+		if (loggedIn)
+		{
+			xpBaselinesSeeded = true;
+		}
 	}
 
 	/**
