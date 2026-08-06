@@ -1070,6 +1070,55 @@ public class TelemetryStateTest
 			value(json, "lastChangedAt"));
 	}
 
+	/**
+	 * The defect this fixes: a hop passes through the logged-out clearing path with the session
+	 * still intact. World, vitals, and inventory are re-read by the next sample, but a gain is
+	 * an event and nothing can reconstruct it, so the snapshot claimed there had been no recent
+	 * gain for the rest of the session — while the baselines it is measured against were
+	 * deliberately preserved.
+	 */
+	@Test
+	public void aWorldHopPreservesTheLastExportedExperienceGain()
+	{
+		logIn();
+		state.observeXp("WOODCUTTING", 1_000);
+		now = 1_770_000_004_000L;
+		assertTrue(state.observeXp("WOODCUTTING", 1_065));
+		assertEquals("65", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+
+		// The hop itself: not a session end, so baselines are kept.
+		state.updateSession("LOADING", false);
+		String duringHop = state.nextSnapshot(true).toJson();
+		assertEquals("nothing player-derived is exported mid-hop", "null",
+			value(duringHop, "lastSkill"));
+		assertEquals("null", value(duringHop, "lastDelta"));
+
+		// Back in the same session: the gain is still the most recent one that happened.
+		state.updateSession("LOGGED_IN", true);
+		String afterHop = state.nextSnapshot(true).toJson();
+		assertEquals("\"woodcutting\"", value(afterHop, "lastSkill"));
+		assertEquals("65", value(afterHop, "lastDelta"));
+		assertEquals("1770000004000", value(afterHop, "lastChangedAt"));
+	}
+
+	/** A real session end still discards the gain, so a later login cannot inherit it. */
+	@Test
+	public void aSessionEndStillDiscardsTheLastExportedExperienceGain()
+	{
+		logIn();
+		state.observeXp("WOODCUTTING", 1_000);
+		now = 1_770_000_004_000L;
+		assertTrue(state.observeXp("WOODCUTTING", 1_065));
+
+		state.updateSession("LOGIN_SCREEN", false, true);
+		logIn();
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("a new session inherits no gain", "null", value(json, "lastSkill"));
+		assertEquals("null", value(json, "lastDelta"));
+		assertEquals("null", value(json, "lastChangedAt"));
+	}
+
 	@Test
 	public void aWorldHopDoesNotCauseTheSessionToReseed()
 	{

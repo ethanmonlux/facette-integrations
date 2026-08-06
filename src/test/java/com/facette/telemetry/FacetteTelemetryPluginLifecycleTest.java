@@ -558,6 +558,44 @@ public class FacetteTelemetryPluginLifecycleTest
 		plugin.shutDown();
 	}
 
+	/**
+	 * The round-4 finding, through the plugin: a hop must not erase the session's most recent
+	 * gain, because no later sample can reconstruct an event.
+	 */
+	@Test
+	public void aWorldHopKeepsTheSessionsMostRecentGain() throws IOException
+	{
+		logInClient();
+		when(client.getSkillExperience(Skill.WOODCUTTING)).thenReturn(1_000);
+		plugin.startUp();
+		runClientThreadQueue();
+		ControlledPublisher executor = onlyExecutor();
+
+		now = 1_770_000_004_000L;
+		statChanged(Skill.WOODCUTTING, 1_065);
+		executor.runScheduledTaskOnce();
+		assertEquals("65", value(snapshotOnDisk(), "lastDelta"));
+
+		// Hop out and back, same session throughout.
+		when(client.getGameState()).thenReturn(GameState.LOADING);
+		gameState(GameState.LOADING);
+		tick();
+		executor.runScheduledTaskOnce();
+		assertEquals("false", value(snapshotOnDisk(), "loggedIn"));
+
+		logInClient();
+		gameState(GameState.LOGGED_IN);
+		tick();
+		executor.runScheduledTaskOnce();
+
+		String json = snapshotOnDisk();
+		assertEquals("\"woodcutting\"", value(json, "lastSkill"));
+		assertEquals("65", value(json, "lastDelta"));
+		assertEquals("1770000004000", value(json, "lastChangedAt"));
+
+		plugin.shutDown();
+	}
+
 	// --- 10. bounded shutdown ----------------------------------------------------------------
 
 	/**

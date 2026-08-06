@@ -734,7 +734,6 @@ final class TelemetryState
 		markIfChanged(world, null);
 		markIfChanged(hitpointsCurrent, null);
 		markIfChanged(usedSlots, null);
-		markIfChanged(lastSkill, null);
 
 		world = null;
 		hitpointsCurrent = null;
@@ -744,9 +743,17 @@ final class TelemetryState
 		runEnergyPercent = null;
 		usedSlots = null;
 		freeSlots = null;
-		lastSkill = null;
-		lastDelta = null;
-		lastChangedAt = null;
+
+		// The experience fields are deliberately left alone. Every other value here is
+		// re-read from the client by the next live sample, so discarding it costs nothing —
+		// but a gain is an event, and no sample can reconstruct one. A world hop passes
+		// through here with the session still intact, and clearing them would mean the
+		// snapshot claimed there had been no recent gain for the rest of that session, when
+		// the baselines it is measured against were deliberately kept.
+		//
+		// Nothing leaks by keeping them: nextSnapshot exports the experience fields only when
+		// the client is live, and forces them null otherwise, whatever these hold. A genuine
+		// session end still discards them, in the sessionEnded branch of updateSession.
 	}
 
 	private void markIfChanged(Object current, Object next)
