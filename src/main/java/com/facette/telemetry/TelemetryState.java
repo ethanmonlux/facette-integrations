@@ -417,6 +417,19 @@ final class TelemetryState
 		// this seed has no event of its own, and stretching the delta to cover it would mean
 		// stamping that portion with a time no event happened at. The baseline already sits at
 		// the live total, so nothing measured here is counted twice later.
+		//
+		// Reported only when this span is the newest thing the exported fields would describe.
+		// Seeding walks every skill in enum order, so several skills can have measurable spans
+		// in one pass; assigning unconditionally would leave whichever skill happened to come
+		// last in that order, not the one whose gain was most recent. The exported experience
+		// fields mean "the most recent gain", so the comparison is on event time, not on
+		// iteration order — and the same check stops a retained event, which is by definition
+		// from the startup window, from displacing a newer live observation.
+		if (lastChangedAt != null && retained.latestEventAtMillis <= lastChangedAt)
+		{
+			return true;
+		}
+
 		lastSkill = skill;
 		lastDelta = retained.latestTotal - retained.earliestTotal;
 		lastChangedAt = retained.latestEventAtMillis;
@@ -458,6 +471,20 @@ final class TelemetryState
 		RetainedXp existing = preInitialXp.get(skill);
 		if (existing == null)
 		{
+			if (totalXp == 0)
+			{
+				// A zero is not trusted to establish the low end of a span. The client can
+				// report zero for a skill while its data is still initializing, and that is
+				// most likely exactly here, in the window before the plugin has sampled
+				// anything. Anchoring a span at zero and then seeing the real total would
+				// export the player's entire skill as a single gain — the same fabrication the
+				// non-advancing rule already prevents, arriving in the opposite order.
+				//
+				// The cost is that a genuine gain on a skill that really was at zero is not
+				// exported. That is the unmeasurable-first-gain limit this window already has,
+				// and losing one export is worth never inventing a whole skill.
+				return false;
+			}
 			preInitialXp.put(skill, new RetainedXp(totalXp, atMillis));
 			return true;
 		}

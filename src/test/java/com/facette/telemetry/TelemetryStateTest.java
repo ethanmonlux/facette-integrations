@@ -788,6 +788,109 @@ public class TelemetryStateTest
 	}
 
 	/**
+	 * The opposite arrival order, which the non-advancing rule alone does not cover: the
+	 * transient zero comes *first*, so it would anchor the span at zero and the real total
+	 * would then read as a gain the size of the whole skill.
+	 */
+	@Test
+	public void aLeadingTransientZeroCannotAnchorASpanAndFabricateAWholeSkillGain()
+	{
+		now = 1_770_000_001_000L;
+		assertFalse("a zero must not establish retained evidence",
+			state.recordPreInitialXp("WOODCUTTING", 0));
+		now = 1_770_000_002_000L;
+		assertTrue("the real total establishes it instead",
+			state.recordPreInitialXp("WOODCUTTING", 1_234_567));
+
+		logIn();
+		assertTrue(state.seedXpBaseline("WOODCUTTING", 1_234_567));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("no whole-skill gain is fabricated", "null", value(json, "lastSkill"));
+		assertEquals("null", value(json, "lastDelta"));
+
+		// The baseline is the truth, so a genuine later gain still measures correctly.
+		now = 1_770_000_009_000L;
+		assertTrue(state.observeXp("WOODCUTTING", 1_234_632));
+		assertEquals("65", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	/**
+	 * Seeding walks every skill in enum order, so several can carry a measurable span in one
+	 * pass. The exported experience fields mean the most recent gain, so the winner must be
+	 * decided by event time rather than by whichever skill the enum happened to visit last.
+	 */
+	@Test
+	public void theNewestRetainedEventWinsRatherThanTheLastSkillSeeded()
+	{
+		// MINING's span ends later than FISHING's.
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("MINING", 5_000);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("FISHING", 100);
+		now = 1_770_000_003_000L;
+		state.recordPreInitialXp("FISHING", 140);
+		now = 1_770_000_004_000L;
+		state.recordPreInitialXp("MINING", 5_060);
+
+		logIn();
+		now = 1_770_000_050_000L;
+		// Seeded in an order that puts the older span last, as enum order well might.
+		assertTrue(state.seedXpBaseline("MINING", 5_060));
+		assertTrue(state.seedXpBaseline("FISHING", 140));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("the most recent gain must win", "\"mining\"", value(json, "lastSkill"));
+		assertEquals("60", value(json, "lastDelta"));
+		assertEquals("1770000004000", value(json, "lastChangedAt"));
+	}
+
+	@Test
+	public void theNewestRetainedEventStillWinsWhenSeededInTheOtherOrder()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("MINING", 5_000);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("FISHING", 100);
+		now = 1_770_000_003_000L;
+		state.recordPreInitialXp("FISHING", 140);
+		now = 1_770_000_004_000L;
+		state.recordPreInitialXp("MINING", 5_060);
+
+		logIn();
+		assertTrue(state.seedXpBaseline("FISHING", 140));
+		assertTrue(state.seedXpBaseline("MINING", 5_060));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("\"mining\"", value(json, "lastSkill"));
+		assertEquals("1770000004000", value(json, "lastChangedAt"));
+	}
+
+	/** A retained event is from the startup window, so it must not displace a newer live gain. */
+	@Test
+	public void aRetainedEventCannotDisplaceANewerLiveObservation()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("MINING", 5_000);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("MINING", 5_060);
+
+		logIn();
+		// A live gain on another skill is observed first, and is more recent.
+		state.observeXp("COOKING", 800);
+		now = 1_770_000_020_000L;
+		assertTrue(state.observeXp("COOKING", 900));
+
+		// Seeding the older retained span must leave the newer live gain in place.
+		assertTrue(state.seedXpBaseline("MINING", 5_060));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("\"cooking\"", value(json, "lastSkill"));
+		assertEquals("100", value(json, "lastDelta"));
+		assertEquals("1770000020000", value(json, "lastChangedAt"));
+	}
+
+	/**
 	 * A transient zero during startup must not become the low end of the span and export the
 	 * player's entire skill as one gain.
 	 */
