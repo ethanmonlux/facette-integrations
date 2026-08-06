@@ -557,7 +557,23 @@ final class TelemetryState
 		Integer previous = xpBaselines.get(skill);
 		if (previous == null)
 		{
-			// First reading this session: seed the comparison, report nothing.
+			if (totalXp == 0)
+			{
+				// A zero never becomes a baseline. The client can report zero for a skill while
+				// its data is still initializing, and an event can reach here before the first
+				// live sample has seeded — a run that initialized mid-hop is logged in and
+				// observing before any trusted total has been read. Anchoring at zero would then
+				// export the character's entire skill total as one delta, which is both a
+				// fabricated gain and, because that delta equals the total, the total itself
+				// leaving the client through a field that is only ever meant to carry a change.
+				//
+				// Leaving the skill unseeded is safe: the next non-zero observation seeds it, and
+				// a live seed can still claim it because no baseline is in the way. The cost is
+				// that a genuine gain on a skill truly at zero is not exported, the same bounded
+				// loss the retained-evidence path accepts for the same reason.
+				return false;
+			}
+			// First trustworthy reading this session: seed the comparison, report nothing.
 			xpBaselines.put(skill, totalXp);
 			return false;
 		}

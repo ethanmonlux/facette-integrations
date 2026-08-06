@@ -1058,6 +1058,49 @@ public class TelemetryStateTest
 			state.needsXpBaselineSeeding());
 	}
 
+	/**
+	 * The reachable sequence: a run initializes during a hop, the client goes live, and a
+	 * transient zero arrives before the first tick can seed. Anchoring the baseline at zero
+	 * would export the character's whole skill total as a single delta.
+	 */
+	@Test
+	public void aTransientZeroObservationNeverBecomesABaseline()
+	{
+		logIn();
+		assertFalse("a zero must not seed a baseline", state.observeXp("WOODCUTTING", 0));
+
+		// The real total arrives. It seeds, and reports nothing.
+		assertFalse("the real total seeds instead", state.observeXp("WOODCUTTING", 1_234_567));
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("no whole-skill gain is fabricated", "null", value(json, "lastSkill"));
+		assertEquals("null", value(json, "lastDelta"));
+
+		// And the comparison is now against the truth.
+		now = 1_770_000_009_000L;
+		assertTrue(state.observeXp("WOODCUTTING", 1_234_632));
+		assertEquals("65", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
+	/**
+	 * Refusing the zero also leaves the skill claimable by a trusted live seed, which is what
+	 * stops the defect being merely deferred: a baseline of zero would have survived seeding,
+	 * because seeding never replaces a baseline that already exists.
+	 */
+	@Test
+	public void aRefusedZeroLeavesTheSkillOpenToATrustedLiveSeed()
+	{
+		logIn();
+		state.observeXp("WOODCUTTING", 0);
+
+		// The first live sample seeds from the client's real total.
+		assertTrue("no baseline is in the way", state.seedXpBaseline("WOODCUTTING", 1_234_567));
+		assertEquals("null", value(state.nextSnapshot(true).toJson(), "lastSkill"));
+
+		now = 1_770_000_009_000L;
+		assertTrue(state.observeXp("WOODCUTTING", 1_234_632));
+		assertEquals("65", value(state.nextSnapshot(true).toJson(), "lastDelta"));
+	}
+
 	@Test
 	public void experienceIsNotObservedWhileLoggedOut()
 	{

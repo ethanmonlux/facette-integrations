@@ -476,6 +476,45 @@ public class FacetteTelemetryPluginLifecycleTest
 		plugin.shutDown();
 	}
 
+	/**
+	 * The round-2 P1, driven end to end through the plugin: the run initializes during a
+	 * loading screen, the client goes live, and a transient zero arrives before the first tick
+	 * can seed. Nothing may anchor a baseline at zero, because the delta that follows would be
+	 * the character's entire skill total.
+	 */
+	@Test
+	public void aTransientZeroBetweenLoginAndTheFirstTickCannotFabricateAWholeSkillGain()
+			throws IOException
+	{
+		when(client.getGameState()).thenReturn(GameState.LOADING);
+		plugin.startUp();
+		runClientThreadQueue();
+		ControlledPublisher executor = onlyExecutor();
+
+		// The client goes live, but no tick has seeded yet.
+		logInClient();
+		when(client.getSkillExperience(Skill.WOODCUTTING)).thenReturn(1_234_567);
+		gameState(GameState.LOGGED_IN);
+
+		// A transient zero lands in that window.
+		statChanged(Skill.WOODCUTTING, 0);
+
+		// The first tick seeds from the client's real total, unobstructed.
+		tick();
+		executor.runScheduledTaskOnce();
+		assertEquals("no gain may be reported yet", "null", value(snapshotOnDisk(), "lastSkill"));
+
+		// A genuine gain is then measured against the truth, not against zero.
+		now = 1_770_000_009_000L;
+		statChanged(Skill.WOODCUTTING, 1_234_632);
+		executor.runScheduledTaskOnce();
+		String json = snapshotOnDisk();
+		assertEquals("\"woodcutting\"", value(json, "lastSkill"));
+		assertEquals("65", value(json, "lastDelta"));
+
+		plugin.shutDown();
+	}
+
 	// --- 9. logout and login without disabling ----------------------------------------------
 
 	@Test
