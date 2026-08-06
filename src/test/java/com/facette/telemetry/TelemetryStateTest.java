@@ -866,6 +866,65 @@ public class TelemetryStateTest
 		assertEquals("1770000004000", value(json, "lastChangedAt"));
 	}
 
+	/**
+	 * Events delivered in one game tick routinely share a millisecond, so wall time cannot
+	 * separate them. Selection is by arrival position, which has no ties.
+	 */
+	@Test
+	public void twoRetainedSpansInTheSameMillisecondAreSeparatedByArrivalOrder()
+	{
+		// Every event at the same instant. Only arrival order distinguishes them.
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("MINING", 5_000);
+		state.recordPreInitialXp("FISHING", 100);
+		state.recordPreInitialXp("MINING", 5_060);
+		// FISHING's span is completed last, so FISHING is the most recent gain.
+		state.recordPreInitialXp("FISHING", 140);
+
+		logIn();
+		// Seeded oldest-span-first, which is what makes this discriminating: a rule that keeps
+		// the incumbent on a tie would leave MINING here, and only arrival order picks FISHING.
+		assertTrue(state.seedXpBaseline("MINING", 5_060));
+		assertTrue(state.seedXpBaseline("FISHING", 140));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("the later-arriving span wins a tied millisecond", "\"fishing\"",
+			value(json, "lastSkill"));
+		assertEquals("40", value(json, "lastDelta"));
+		assertEquals("1770000001000", value(json, "lastChangedAt"));
+	}
+
+	/**
+	 * The defect this fixes: selection used the exported wall-clock timestamp, so a backward
+	 * clock adjustment between two events gave the *older* one the larger value and let it win.
+	 * That is the same class of error the monotonic cadence source exists to prevent, in a
+	 * different decision.
+	 */
+	@Test
+	public void aBackwardWallClockJumpBetweenRetainedEventsDoesNotReorderThem()
+	{
+		now = 1_770_000_005_000L;
+		state.recordPreInitialXp("MINING", 5_000);
+		state.recordPreInitialXp("MINING", 5_060);
+
+		// The wall clock is corrected backwards, then FISHING's span completes. FISHING is
+		// genuinely the more recent gain even though its timestamp is now smaller.
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("FISHING", 100);
+		state.recordPreInitialXp("FISHING", 140);
+
+		logIn();
+		assertTrue(state.seedXpBaseline("FISHING", 140));
+		assertTrue(state.seedXpBaseline("MINING", 5_060));
+
+		String json = state.nextSnapshot(true).toJson();
+		assertEquals("arrival order decides, not the adjusted clock", "\"fishing\"",
+			value(json, "lastSkill"));
+		assertEquals("40", value(json, "lastDelta"));
+		assertEquals("and the exported time is still the event's own wall time",
+			"1770000001000", value(json, "lastChangedAt"));
+	}
+
 	/** A retained event is from the startup window, so it must not displace a newer live gain. */
 	@Test
 	public void aRetainedEventCannotDisplaceANewerLiveObservation()

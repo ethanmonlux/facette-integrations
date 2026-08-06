@@ -120,14 +120,25 @@ final class TelemetryState
 		/** Total at the most recent strictly increasing observation. */
 		private int latestTotal;
 
-		/** Wall-clock time of the observation that last advanced {@link #latestTotal}. */
+		/**
+		 * Wall-clock time of the observation that last advanced {@link #latestTotal}. Exported
+		 * as {@code lastChangedAt}, and used for nothing else — deciding which span is most
+		 * recent is {@link #latestEventOrder}'s job.
+		 */
 		private long latestEventAtMillis;
 
-		private RetainedXp(int total, long atMillis)
+		/**
+		 * Arrival position of the observation that last advanced {@link #latestTotal}, from the
+		 * owning state's monotonic counter. Never exported.
+		 */
+		private long latestEventOrder;
+
+		private RetainedXp(int total, long atMillis, long order)
 		{
 			this.earliestTotal = total;
 			this.latestTotal = total;
 			this.latestEventAtMillis = atMillis;
+			this.latestEventOrder = order;
 		}
 
 		/**
@@ -137,7 +148,7 @@ final class TelemetryState
 		 * entirely — it does not lower a total, and it does not move the timestamp, because a
 		 * dip or a transient reading is not an event the exported delta represents.
 		 */
-		private void observe(int total, long atMillis)
+		private void observe(int total, long atMillis, long order)
 		{
 			if (total <= latestTotal)
 			{
@@ -145,6 +156,7 @@ final class TelemetryState
 			}
 			latestTotal = total;
 			latestEventAtMillis = atMillis;
+			latestEventOrder = order;
 		}
 
 		/** Whether two distinct increasing totals bound a span that can actually be measured. */
@@ -160,6 +172,24 @@ final class TelemetryState
 	 * previous session's comparison.
 	 */
 	private boolean xpBaselinesSeeded;
+
+	/**
+	 * Monotonic counter over experience events this state has recorded, used only to decide
+	 * which gain is most recent. Never exported and never compared against a clock.
+	 *
+	 * <p>Recency cannot be decided from {@code lastChangedAt}. Two skills whose events arrive
+	 * in one game tick commonly share a millisecond, and a wall clock can be adjusted
+	 * backwards between two events, which would make the older one look newer. Both would
+	 * silently put the wrong skill in the exported experience fields. Arrival position has
+	 * neither problem: it is exact, it has no ties, and no clock adjustment can reorder it.
+	 */
+	private long xpEventOrder;
+
+	/**
+	 * Arrival position of the gain the exported experience fields currently describe. Zero
+	 * when they describe nothing, which is why the counter starts at one.
+	 */
+	private long lastReportedXpOrder;
 
 	private boolean dirty = true;
 
@@ -279,6 +309,8 @@ final class TelemetryState
 			lastSkill = null;
 			lastDelta = null;
 			lastChangedAt = null;
+			// The fields describe nothing again, so nothing outranks the next gain.
+			lastReportedXpOrder = 0L;
 		}
 	}
 
@@ -421,11 +453,15 @@ final class TelemetryState
 		// Reported only when this span is the newest thing the exported fields would describe.
 		// Seeding walks every skill in enum order, so several skills can have measurable spans
 		// in one pass; assigning unconditionally would leave whichever skill happened to come
-		// last in that order, not the one whose gain was most recent. The exported experience
-		// fields mean "the most recent gain", so the comparison is on event time, not on
-		// iteration order — and the same check stops a retained event, which is by definition
-		// from the startup window, from displacing a newer live observation.
-		if (lastChangedAt != null && retained.latestEventAtMillis <= lastChangedAt)
+		// last in that order, not the one whose gain was most recent.
+		//
+		// Compared by arrival position rather than by the exported timestamp. Wall time cannot
+		// decide this: events delivered in one game tick routinely share a millisecond, which
+		// would silently fall back to enum order, and an adjustment of the wall clock between
+		// two events would make the older one carry the larger timestamp and win outright. The
+		// same comparison also stops a retained event — always from the startup window, so
+		// always earlier — from displacing a newer live observation.
+		if (retained.latestEventOrder <= lastReportedXpOrder)
 		{
 			return true;
 		}
@@ -433,6 +469,7 @@ final class TelemetryState
 		lastSkill = skill;
 		lastDelta = retained.latestTotal - retained.earliestTotal;
 		lastChangedAt = retained.latestEventAtMillis;
+		lastReportedXpOrder = retained.latestEventOrder;
 		markDirty();
 		return true;
 	}
@@ -468,6 +505,7 @@ final class TelemetryState
 			return false;
 		}
 		long atMillis = wallClockMillis.getAsLong();
+		long order = ++xpEventOrder;
 		RetainedXp existing = preInitialXp.get(skill);
 		if (existing == null)
 		{
@@ -485,10 +523,10 @@ final class TelemetryState
 				// and losing one export is worth never inventing a whole skill.
 				return false;
 			}
-			preInitialXp.put(skill, new RetainedXp(totalXp, atMillis));
+			preInitialXp.put(skill, new RetainedXp(totalXp, atMillis, order));
 			return true;
 		}
-		existing.observe(totalXp, atMillis);
+		existing.observe(totalXp, atMillis, order);
 		return false;
 	}
 
@@ -590,6 +628,11 @@ final class TelemetryState
 		lastSkill = skill;
 		lastDelta = totalXp - previous;
 		lastChangedAt = wallClockMillis.getAsLong();
+		// A live observation is always the newest thing seen: retained evidence is only ever
+		// recorded before initialization, and this counter only moves forward. So no comparison
+		// is needed here — but the position is still recorded, because it is what a later
+		// retained span is measured against.
+		lastReportedXpOrder = ++xpEventOrder;
 		markDirty();
 		return true;
 	}
