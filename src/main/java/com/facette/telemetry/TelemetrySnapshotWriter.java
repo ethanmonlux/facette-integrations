@@ -58,10 +58,18 @@ final class TelemetrySnapshotWriter
 	/** Hard ceiling on the serialized target, in UTF-8 bytes. */
 	static final int MAX_SNAPSHOT_BYTES = 16_384;
 
-	/** Name of the exported file inside the plugin's data directory. */
-	static final String TARGET_FILE_NAME = "state-v1.json";
+	/**
+	 * Name of the exported file inside the plugin's data directory.
+	 *
+	 * <p>Versioned in the name, so schema 2 lands beside any schema-1 file a previous build
+	 * left rather than on top of it. This writer never opens, reads, migrates, or deletes the
+	 * schema-1 file: it names one target and sweeps only temporary files matching its own
+	 * versioned prefix, so a {@code state-v1.json} sitting in the same directory is not even
+	 * enumerated.
+	 */
+	static final String TARGET_FILE_NAME = "state-v2.json";
 
-	private static final String TEMP_PREFIX = "state-v1-";
+	private static final String TEMP_PREFIX = "state-v2-";
 	private static final String TEMP_SUFFIX = ".tmp";
 
 	/**

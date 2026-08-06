@@ -24,10 +24,14 @@
  */
 package com.facette.telemetry;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
@@ -47,15 +51,35 @@ import java.util.function.LongSupplier;
  * shutdown, which otherwise could race the publisher thread.
  *
  * <p>The per-skill experience baselines are session-local comparison state and are never
- * exported.
+ * exported. Neither is the arrival-order counter, the change counter, or the elapsed reading
+ * used for cadence.
  */
 final class TelemetryState
 {
 	/** Old School inventory capacity, in slots. */
-	static final int INVENTORY_CAPACITY = 28;
+	static final int INVENTORY_CAPACITY = TelemetrySnapshot.INVENTORY_SLOTS;
 
 	/** Divisor converting RuneLite's 1/100th-of-a-percent run energy into whole percent. */
 	private static final int RUN_ENERGY_SCALE = 100;
+
+	/**
+	 * Divisor converting the client's 1/10th-of-a-percent special attack energy into whole
+	 * percent, matching how the client's own interface scales it.
+	 */
+	private static final int SPECIAL_ATTACK_SCALE = 10;
+
+	/**
+	 * Bounds outside which a reported weight is not treated as a weight at all.
+	 *
+	 * <p>Generous by a wide margin: every item in the game carried at once falls inside this,
+	 * and so does a full set of weight-reducing equipment at its negative extreme. The bounds
+	 * exist to keep the exported number finite and short rather than to second-guess the
+	 * client, so a reading outside them is reported as unavailable rather than clamped into a
+	 * plausible-looking lie.
+	 */
+	private static final int WEIGHT_MIN_KG = -1_000;
+
+	private static final int WEIGHT_MAX_KG = 1_000_000;
 
 	private static final String UNKNOWN_GAME_STATE = "UNKNOWN";
 
@@ -65,12 +89,23 @@ final class TelemetryState
 	 */
 	private static final String OVERALL_SKILL_NAME = "overall";
 
+	/**
+	 * Hard ceiling on the number of skills the exported session-gain collection can describe.
+	 *
+	 * <p>Old School has fewer skills than this and the caller only ever passes real ones, so it
+	 * is unreachable in practice. It is here because that collection is the one exported thing
+	 * keyed by something the client supplies, and a bound that does not depend on the caller
+	 * behaving is what makes the document size provably independent of play duration.
+	 */
+	private static final int MAX_TRACKED_SKILLS = 32;
+
 	private final String instanceId;
 
 	/**
 	 * Wall-clock milliseconds. The only source for values that leave this process as
-	 * timestamps — {@code emittedAt} and the experience {@code lastChangedAt}. Never used to
-	 * measure an interval, because it can jump in either direction.
+	 * timestamps — {@code emittedAt}, {@code trackingStartedAt}, and the experience
+	 * {@code lastChangedAt}. Never used to measure an interval, because it can jump in either
+	 * direction.
 	 */
 	private final LongSupplier wallClockMillis;
 
@@ -85,6 +120,16 @@ final class TelemetryState
 	private final Map<String, Integer> xpBaselines = new HashMap<>();
 
 	/**
+	 * Cumulative session-local experience gains, keyed by lowercase skill name.
+	 *
+	 * <p>One entry per skill that has actually advanced during the tracked session, so the
+	 * collection is bounded by the number of skills rather than by the number of gains. Entries
+	 * are discarded wholesale at a session boundary, which is what stops a later login from
+	 * inheriting another character's totals.
+	 */
+	private final Map<String, TrackedSkillGain> sessionXpGains = new HashMap<>();
+
+	/**
 	 * Experience evidence retained per skill while the run was still starting, keyed by
 	 * lowercase skill name.
 	 *
@@ -96,6 +141,41 @@ final class TelemetryState
 	 * long startup stays queued or how many events arrive.
 	 */
 	private final Map<String, RetainedXp> preInitialXp = new HashMap<>();
+
+	/**
+	 * One skill's accumulated session gain, mutable because it is updated in place on every
+	 * gain rather than replaced.
+	 *
+	 * <p>Carries the caller's enum position so the exported collection can be ordered by it.
+	 * That position is never exported; it exists only to make the order deterministic and
+	 * independent of the order gains happened to arrive in.
+	 */
+	private static final class TrackedSkillGain
+	{
+		private final String skill;
+		private final int order;
+		private int gained;
+		private int lastDelta;
+		private long lastChangedAt;
+
+		private TrackedSkillGain(String skill, int order)
+		{
+			this.skill = skill;
+			this.order = order;
+		}
+
+		private void add(int delta, long atMillis)
+		{
+			gained += delta;
+			lastDelta = delta;
+			lastChangedAt = atMillis;
+		}
+
+		private TelemetrySkillGain exported()
+		{
+			return new TelemetrySkillGain(skill, gained, lastDelta, lastChangedAt);
+		}
+	}
 
 	/**
 	 * The experience evidence one skill accumulated before the run finished initializing,
@@ -211,16 +291,50 @@ final class TelemetryState
 
 	private String gameState = UNKNOWN_GAME_STATE;
 	private boolean loggedIn;
+
+	/**
+	 * Whether a live sample has populated every player-derived value the schema requires while
+	 * logged in.
+	 *
+	 * <p>This is what {@code session.loggedIn} actually reports: not "the client is at the
+	 * logged-in game state" but "the player-derived data in this document is valid". The two
+	 * differ for up to one tick after a login or a world hop, and reporting them as the same
+	 * thing would leave exactly one class of dishonest document — one claiming a live session
+	 * while its inventory, equipment, and prayer collections had never been read. Publishing
+	 * empty collections in that window would be worse still: it would assert an empty
+	 * inventory and no active prayers rather than admitting nothing had been read yet.
+	 */
+	private boolean playerStateComplete;
+
 	private Integer world;
+	private Integer combatLevel;
+
+	/**
+	 * When this plugin instance established its baselines for the current logged-in session.
+	 *
+	 * <p>Not a login time and not claimed to be one: it is when this plugin started tracking,
+	 * which is later than the login whenever the plugin was enabled mid-session. Survives a
+	 * world hop with the session and is discarded at a session boundary.
+	 */
+	private Long trackingStartedAt;
 
 	private Integer hitpointsCurrent;
 	private Integer hitpointsBase;
 	private Integer prayerCurrent;
 	private Integer prayerBase;
 	private Integer runEnergyPercent;
+	private Integer specialAttackPercent;
+	private Integer weightKg;
+
+	private String attackStyle;
+	private List<String> activePrayers;
+	private TelemetryTarget target;
+
+	private List<TelemetryItemSlot> equipmentSlots;
 
 	private Integer usedSlots;
 	private Integer freeSlots;
+	private List<TelemetryItemSlot> inventorySlots;
 
 	private String lastSkill;
 	private Integer lastDelta;
@@ -277,12 +391,14 @@ final class TelemetryState
 	 * two separately synchronized calls leave a window the publisher can be released into:
 	 * discarding the experience baselines marks the state dirty, so a publication could
 	 * observe cleared experience while the session still read as live and still carried the
-	 * previous world, vitals, and inventory. One transition makes that unobservable by
-	 * construction rather than by the caller happening to order the two correctly.
+	 * previous world, vitals, inventory, equipment, prayers, and target. One transition makes
+	 * that unobservable by construction rather than by the caller happening to order the two
+	 * correctly.
 	 *
 	 * @param sessionEnded whether reaching this state ends the play session, discarding the
-	 *                     session-local experience baselines so a later login cannot inherit
-	 *                     a previous session's comparison and report a fabricated gain
+	 *                     session-local experience baselines and accumulated gains so a later
+	 *                     login cannot inherit a previous session's comparison and report a
+	 *                     fabricated gain
 	 */
 	synchronized void updateSession(String gameStateName, boolean nowLoggedIn, boolean sessionEnded)
 	{
@@ -305,10 +421,18 @@ final class TelemetryState
 			preInitialXp.clear();
 			// The next live session seeds its own baselines rather than running without any.
 			xpBaselinesSeeded = false;
+			if (!sessionXpGains.isEmpty())
+			{
+				markDirty();
+				sessionXpGains.clear();
+			}
 			markIfChanged(lastSkill, null);
 			lastSkill = null;
 			lastDelta = null;
 			lastChangedAt = null;
+			// Tracking belongs to the session that ended; the next one starts its own.
+			markIfChanged(trackingStartedAt, null);
+			trackingStartedAt = null;
 			// The fields describe nothing again, so nothing outranks the next gain.
 			lastReportedXpOrder = 0L;
 		}
@@ -325,48 +449,188 @@ final class TelemetryState
 	}
 
 	/**
+	 * Records the local player's combat level.
+	 *
+	 * <p>A non-positive level is not a combat level; it is what the client reports before the
+	 * local player has been resolved, and is exported as unavailable rather than as zero.
+	 */
+	synchronized void updateCombatLevel(int level)
+	{
+		if (!loggedIn)
+		{
+			return;
+		}
+		Integer next = level > 0 ? Integer.valueOf(level) : null;
+		markIfChanged(combatLevel, next);
+		combatLevel = next;
+	}
+
+	/**
 	 * Records the player's vitals.
 	 *
-	 * @param rawRunEnergy run energy exactly as RuneLite reports it, in units of 1/100th of
-	 *                     a percent; normalized here to whole percent in 0..100
+	 * @param rawRunEnergy      run energy exactly as RuneLite reports it, in units of 1/100th
+	 *                          of a percent; normalized here to whole percent in 0..100
+	 * @param rawSpecialAttack  special attack energy exactly as the client reports it, in units
+	 *                          of 1/10th of a percent; normalized here to whole percent in
+	 *                          0..100
+	 * @param rawWeightKg       the weight the client reports, in kilograms; exported as
+	 *                          unavailable rather than clamped when it falls outside the
+	 *                          bounds a real load can reach
 	 */
-	synchronized void updateVitals(int hpCurrent, int hpBase, int prayCurrent, int prayBase, int rawRunEnergy)
+	synchronized void updateVitals(int hpCurrent, int hpBase, int prayCurrent, int prayBase,
+		int rawRunEnergy, int rawSpecialAttack, int rawWeightKg)
 	{
 		if (!loggedIn)
 		{
 			return;
 		}
 		Integer energy = clamp(rawRunEnergy / RUN_ENERGY_SCALE, 0, 100);
+		Integer special = clamp(rawSpecialAttack / SPECIAL_ATTACK_SCALE, 0, 100);
+		Integer weight = rawWeightKg >= WEIGHT_MIN_KG && rawWeightKg <= WEIGHT_MAX_KG
+			? Integer.valueOf(rawWeightKg)
+			: null;
 		markIfChanged(hitpointsCurrent, hpCurrent);
 		markIfChanged(hitpointsBase, hpBase);
 		markIfChanged(prayerCurrent, prayCurrent);
 		markIfChanged(prayerBase, prayBase);
 		markIfChanged(runEnergyPercent, energy);
+		markIfChanged(specialAttackPercent, special);
+		markIfChanged(weightKg, weight);
 		hitpointsCurrent = hpCurrent;
 		hitpointsBase = hpBase;
 		prayerCurrent = prayCurrent;
 		prayerBase = prayBase;
 		runEnergyPercent = energy;
+		specialAttackPercent = special;
+		weightKg = weight;
 	}
 
 	/**
-	 * Records inventory occupancy.
+	 * Records the player's current combat configuration.
 	 *
-	 * @param occupiedSlots number of inventory slots holding an item, not a total item
-	 *                      quantity
+	 * @param style          the normalized attack-style label, or null when no trustworthy
+	 *                       reading exists. Null is a legitimate steady state, not a failure
+	 * @param prayers        the active prayer names in the caller's deterministic order; empty
+	 *                       when none is active. A null collection is refused rather than
+	 *                       treated as none active, because "not read" and "none active" are
+	 *                       different claims and only one of them is ever true
+	 * @return true when the prayer collection was accepted
 	 */
-	synchronized void updateInventory(int occupiedSlots)
+	synchronized boolean updateCombat(String style, List<String> prayers)
+	{
+		if (!loggedIn || prayers == null)
+		{
+			return false;
+		}
+		List<String> nextPrayers = Collections.unmodifiableList(new ArrayList<>(prayers));
+		markIfChanged(attackStyle, style);
+		markIfChanged(activePrayers, nextPrayers);
+		attackStyle = style;
+		activePrayers = nextPrayers;
+		return true;
+	}
+
+	/**
+	 * Records the NPC the local player is interacting with, or its absence.
+	 *
+	 * <p>Passing null is a real update rather than a no-op: the target has to disappear the
+	 * moment the interaction ends, the actor becomes impermissible, or the actor is gone.
+	 */
+	synchronized void updateTarget(TelemetryTarget npcTarget)
 	{
 		if (!loggedIn)
 		{
 			return;
 		}
-		Integer used = clamp(occupiedSlots, 0, INVENTORY_CAPACITY);
-		Integer free = INVENTORY_CAPACITY - used;
+		markIfChanged(target, npcTarget);
+		target = npcTarget;
+	}
+
+	/**
+	 * Records the eleven visible equipment slots.
+	 *
+	 * @param slots exactly one entry per exported equipment slot, in exported order. Any other
+	 *              size is refused rather than padded or truncated, because padding would
+	 *              claim empty slots the client never reported
+	 * @return true when the reading was accepted
+	 */
+	synchronized boolean updateEquipment(List<TelemetryItemSlot> slots)
+	{
+		if (!loggedIn || slots == null || slots.size() != TelemetrySnapshot.EQUIPMENT_SLOTS.size())
+		{
+			return false;
+		}
+		List<TelemetryItemSlot> next = Collections.unmodifiableList(new ArrayList<>(slots));
+		markIfChanged(equipmentSlots, next);
+		equipmentSlots = next;
+		return true;
+	}
+
+	/**
+	 * Records all twenty-eight inventory slots, and the occupancy they imply.
+	 *
+	 * <p>Occupancy counts slots holding an item, never item quantity: one slot holding a
+	 * million coins is one used slot.
+	 *
+	 * @param slots exactly {@link #INVENTORY_CAPACITY} entries, in ascending slot order
+	 * @return true when the reading was accepted
+	 */
+	synchronized boolean updateInventory(List<TelemetryItemSlot> slots)
+	{
+		if (!loggedIn || slots == null || slots.size() != INVENTORY_CAPACITY)
+		{
+			return false;
+		}
+		List<TelemetryItemSlot> next = Collections.unmodifiableList(new ArrayList<>(slots));
+		int occupied = 0;
+		for (TelemetryItemSlot slot : next)
+		{
+			if (slot.isOccupied())
+			{
+				occupied++;
+			}
+		}
+		Integer used = Integer.valueOf(occupied);
+		Integer free = Integer.valueOf(INVENTORY_CAPACITY - occupied);
 		markIfChanged(usedSlots, used);
 		markIfChanged(freeSlots, free);
+		markIfChanged(inventorySlots, next);
 		usedSlots = used;
 		freeSlots = free;
+		inventorySlots = next;
+		return true;
+	}
+
+	/**
+	 * Records that the current live sample populated every player-derived value the schema
+	 * requires, so a snapshot may now report the session as carrying valid player data.
+	 *
+	 * <p>Refused while any of those values is still missing. That refusal is the whole point:
+	 * it is what makes "logged in implies a complete player block" true by construction rather
+	 * than by the sampler happening to have read everything before the publisher woke up.
+	 *
+	 * @return true when the state now carries a complete player block
+	 */
+	synchronized boolean markPlayerStateComplete()
+	{
+		if (!loggedIn
+			|| world == null
+			|| combatLevel == null
+			|| hitpointsCurrent == null
+			|| hitpointsBase == null
+			|| prayerCurrent == null
+			|| prayerBase == null
+			|| runEnergyPercent == null
+			|| specialAttackPercent == null
+			|| activePrayers == null
+			|| equipmentSlots == null
+			|| inventorySlots == null)
+		{
+			return false;
+		}
+		markIfChanged(playerStateComplete, true);
+		playerStateComplete = true;
+		return true;
 	}
 
 	/**
@@ -376,13 +640,13 @@ final class TelemetryState
 	 * <p>This exists because the plugin can be enabled while the player is already logged in.
 	 * The login-time experience events have long since fired, so nothing has filled the
 	 * baselines, and the next real gain would otherwise be consumed by
-	 * {@link #observeXp(String, int)}'s first-observation rule and never exported. Seeding
+	 * {@link #observeXp(String, int, int)}'s first-observation rule and never exported. Seeding
 	 * from the live totals means that gain is measured against the truth instead.
 	 *
 	 * <p>Deliberately separate from {@code observeXp} rather than reusing it: this is not an
-	 * event, it can never report a gain, and it must never move a baseline that already
-	 * exists. Sharing one method would make the caller's intent — and those invariants —
-	 * depend on which branch happened to be taken.
+	 * event, it can never report a gain by itself, and it must never move a baseline that
+	 * already exists. Sharing one method would make the caller's intent — and those
+	 * invariants — depend on which branch happened to be taken.
 	 *
 	 * <p>Unlike {@code observeXp}, this rejects the {@code OVERALL} sentinel, because the
 	 * caller enumerates skills programmatically and a non-real entry could appear in that
@@ -394,11 +658,13 @@ final class TelemetryState
 	 * absorbed into the baseline and never exported, and the amount absorbed would grow with
 	 * however long the client took to run the callback.
 	 *
-	 * @param totalXp the client's current total for the skill; zero is legitimate for an
-	 *                untrained skill and is seeded, while a negative total is refused
+	 * @param skillOrder the caller's enum position for this skill, used only to order the
+	 *                   exported session-gain collection and never exported itself
+	 * @param totalXp    the client's current total for the skill; zero is legitimate for an
+	 *                   untrained skill and is seeded, while a negative total is refused
 	 * @return true when this call established a new baseline
 	 */
-	synchronized boolean seedXpBaseline(String skillName, int totalXp)
+	synchronized boolean seedXpBaseline(String skillName, int skillOrder, int totalXp)
 	{
 		if (!loggedIn || skillName == null || totalXp < 0)
 		{
@@ -449,8 +715,12 @@ final class TelemetryState
 		// this seed has no event of its own, and stretching the delta to cover it would mean
 		// stamping that portion with a time no event happened at. The baseline already sits at
 		// the live total, so nothing measured here is counted twice later.
-		//
-		// Reported only when this span is the newest thing the exported fields would describe.
+		int span = retained.latestTotal - retained.earliestTotal;
+		// The skill's own session total always takes the span: it is that skill's gain whether
+		// or not it is also the most recent gain in the session.
+		accumulateSessionGain(skill, skillOrder, span, retained.latestEventAtMillis);
+
+		// The latest-gain triple, by contrast, describes one gain and can hold only the newest.
 		// Seeding walks every skill in enum order, so several skills can have measurable spans
 		// in one pass; assigning unconditionally would leave whichever skill happened to come
 		// last in that order, not the one whose gain was most recent.
@@ -467,7 +737,7 @@ final class TelemetryState
 		}
 
 		lastSkill = skill;
-		lastDelta = retained.latestTotal - retained.earliestTotal;
+		lastDelta = span;
 		lastChangedAt = retained.latestEventAtMillis;
 		lastReportedXpOrder = retained.latestEventOrder;
 		markDirty();
@@ -483,7 +753,7 @@ final class TelemetryState
 	 *
 	 * <p>One aggregate entry per skill, updated in place. The first observation fixes the
 	 * earliest total and can never report a gain by itself, for the reason given in
-	 * {@link #seedXpBaseline(String, int)}. Each later strict increase extends the span and
+	 * {@link #seedXpBaseline(String, int, int)}. Each later strict increase extends the span and
 	 * moves its event time, so the delta eventually exported is stamped with the event that
 	 * last contributed to it rather than with whenever seeding happened to run. An equal or
 	 * lower total moves neither.
@@ -565,14 +835,21 @@ final class TelemetryState
 
 	/**
 	 * Records that this session's baselines have been seeded, so the client is not re-read on
-	 * every subsequent sample. Refused while logged out, where any totals read would not
-	 * belong to a live session.
+	 * every subsequent sample, and stamps when this plugin instance started tracking the
+	 * session. Refused while logged out, where any totals read would not belong to a live
+	 * session.
 	 */
 	synchronized void markXpBaselinesSeeded()
 	{
-		if (loggedIn)
+		if (!loggedIn)
 		{
-			xpBaselinesSeeded = true;
+			return;
+		}
+		xpBaselinesSeeded = true;
+		if (trackingStartedAt == null)
+		{
+			trackingStartedAt = wallClockMillis.getAsLong();
+			markDirty();
 		}
 	}
 
@@ -580,18 +857,28 @@ final class TelemetryState
 	 * Observes a skill's total experience.
 	 *
 	 * <p>The first observation for a skill in a session only seeds the comparison; it never
-	 * reports a gain. Only a subsequent increase updates the exported experience fields. The
-	 * total itself is never exported.
+	 * reports a gain. Only a subsequent increase updates the exported experience fields and
+	 * the skill's session total. The total itself is never exported.
 	 *
+	 * @param skillOrder the caller's enum position for this skill, used only to order the
+	 *                   exported session-gain collection and never exported itself
 	 * @return true when this observation produced a reportable gain
 	 */
-	synchronized boolean observeXp(String skillName, int totalXp)
+	synchronized boolean observeXp(String skillName, int skillOrder, int totalXp)
 	{
 		if (!loggedIn || skillName == null)
 		{
 			return false;
 		}
 		String skill = skillName.toLowerCase(Locale.ROOT);
+		if (OVERALL_SKILL_NAME.equals(skill))
+		{
+			// Refused here as well as in seeding. A real experience event always carries a real
+			// skill, so this is unreachable from the client — but the aggregate sentinel must have
+			// no path into the exported experience fields at all, not merely no path into the
+			// per-skill collection.
+			return false;
+		}
 		Integer previous = xpBaselines.get(skill);
 		if (previous == null)
 		{
@@ -625,9 +912,13 @@ final class TelemetryState
 		}
 		xpBaselines.put(skill, totalXp);
 
+		int delta = totalXp - previous;
+		long atMillis = wallClockMillis.getAsLong();
+		accumulateSessionGain(skill, skillOrder, delta, atMillis);
+
 		lastSkill = skill;
-		lastDelta = totalXp - previous;
-		lastChangedAt = wallClockMillis.getAsLong();
+		lastDelta = delta;
+		lastChangedAt = atMillis;
 		// A live observation is always the newest thing seen: retained evidence is only ever
 		// recorded before initialization, and this counter only moves forward. So no comparison
 		// is needed here — but the position is still recorded, because it is what a later
@@ -635,6 +926,51 @@ final class TelemetryState
 		lastReportedXpOrder = ++xpEventOrder;
 		markDirty();
 		return true;
+	}
+
+	/**
+	 * Adds one positive gain to a skill's session total.
+	 *
+	 * <p>Refuses the aggregate sentinel and refuses to create an entry beyond the tracked-skill
+	 * ceiling, so the exported collection stays bounded whatever it is fed. An existing entry
+	 * is always updated, so a bound that has been reached cannot stop a real skill's total from
+	 * continuing to advance.
+	 */
+	private void accumulateSessionGain(String skill, int skillOrder, int delta, long atMillis)
+	{
+		if (delta <= 0 || OVERALL_SKILL_NAME.equals(skill))
+		{
+			return;
+		}
+		TrackedSkillGain gain = sessionXpGains.get(skill);
+		if (gain == null)
+		{
+			if (sessionXpGains.size() >= MAX_TRACKED_SKILLS)
+			{
+				return;
+			}
+			gain = new TrackedSkillGain(skill, skillOrder);
+			sessionXpGains.put(skill, gain);
+		}
+		gain.add(delta, atMillis);
+		markDirty();
+	}
+
+	/**
+	 * The session's gains, ordered by the caller's enum position.
+	 *
+	 * <p>Ordering by that position rather than by arrival, name, or size is what makes the
+	 * exported array deterministic: the same set of gains always serializes identically, so a
+	 * reader diffing two snapshots sees only real changes.
+	 */
+	private List<TelemetrySkillGain> exportedSkillGains()
+	{
+		Map<Integer, TelemetrySkillGain> ordered = new TreeMap<>();
+		for (TrackedSkillGain gain : sessionXpGains.values())
+		{
+			ordered.put(gain.order, gain.exported());
+		}
+		return new ArrayList<>(ordered.values());
 	}
 
 	/**
@@ -678,9 +1014,10 @@ final class TelemetryState
 	{
 		pendingVersion = version;
 
-		// Defense in depth: a snapshot never carries player-derived values unless the client
-		// is live and the plugin is running, whatever the fields currently hold.
-		boolean live = pluginActive && loggedIn;
+		// Defense in depth: a snapshot never carries player-derived values unless the client is
+		// live, the plugin is running, and a sample has actually populated them, whatever the
+		// fields currently hold.
+		boolean live = pluginActive && loggedIn && playerStateComplete;
 		TelemetrySnapshot.Builder b = TelemetrySnapshot.builder()
 			.instanceId(instanceId)
 			.seq(nextSeq)
@@ -691,21 +1028,31 @@ final class TelemetryState
 
 		if (live)
 		{
-			b.world(world)
+			b.session(world, combatLevel, trackingStartedAt)
 				.hitpoints(hitpointsCurrent, hitpointsBase)
 				.prayer(prayerCurrent, prayerBase)
 				.runEnergyPercent(runEnergyPercent)
-				.inventory(usedSlots, freeSlots)
-				.xp(lastSkill, lastDelta, lastChangedAt);
+				.specialAttackPercent(specialAttackPercent)
+				.weightKg(weightKg)
+				.combat(attackStyle, activePrayers, target)
+				.equipmentSlots(equipmentSlots)
+				.inventory(usedSlots, freeSlots, inventorySlots)
+				.xp(lastSkill, lastDelta, lastChangedAt)
+				.xpSkills(exportedSkillGains());
 		}
 		else
 		{
-			b.world(null)
+			b.session(null, null, null)
 				.hitpoints(null, null)
 				.prayer(null, null)
 				.runEnergyPercent(null)
-				.inventory(null, null)
-				.xp(null, null, null);
+				.specialAttackPercent(null)
+				.weightKg(null)
+				.combat(null, null, null)
+				.equipmentSlots(null)
+				.inventory(null, null, null)
+				.xp(null, null, null)
+				.xpSkills(null);
 		}
 
 		return b.build();
@@ -731,29 +1078,55 @@ final class TelemetryState
 
 	private void clearPlayerDerived()
 	{
+		markIfChanged(playerStateComplete, false);
 		markIfChanged(world, null);
+		markIfChanged(combatLevel, null);
 		markIfChanged(hitpointsCurrent, null);
+		markIfChanged(hitpointsBase, null);
+		markIfChanged(prayerCurrent, null);
+		markIfChanged(prayerBase, null);
+		markIfChanged(runEnergyPercent, null);
+		markIfChanged(specialAttackPercent, null);
+		markIfChanged(weightKg, null);
+		markIfChanged(attackStyle, null);
+		markIfChanged(activePrayers, null);
+		markIfChanged(target, null);
+		markIfChanged(equipmentSlots, null);
 		markIfChanged(usedSlots, null);
+		markIfChanged(freeSlots, null);
+		markIfChanged(inventorySlots, null);
 
+		playerStateComplete = false;
 		world = null;
+		combatLevel = null;
 		hitpointsCurrent = null;
 		hitpointsBase = null;
 		prayerCurrent = null;
 		prayerBase = null;
 		runEnergyPercent = null;
+		specialAttackPercent = null;
+		weightKg = null;
+		attackStyle = null;
+		activePrayers = null;
+		target = null;
+		equipmentSlots = null;
 		usedSlots = null;
 		freeSlots = null;
+		inventorySlots = null;
 
-		// The experience fields are deliberately left alone. Every other value here is
-		// re-read from the client by the next live sample, so discarding it costs nothing —
-		// but a gain is an event, and no sample can reconstruct one. A world hop passes
-		// through here with the session still intact, and clearing them would mean the
-		// snapshot claimed there had been no recent gain for the rest of that session, when
-		// the baselines it is measured against were deliberately kept.
+		// The experience fields and the tracking stamp are deliberately left alone. Every other
+		// value here is re-read from the client by the next live sample, so discarding it costs
+		// nothing — but a gain is an event, and no sample can reconstruct one, and when tracking
+		// began is a fact about the session rather than about the tick. A world hop passes
+		// through here with the session still intact, and clearing them would mean the snapshot
+		// claimed there had been no recent gain, and no accumulated session experience, for the
+		// rest of that session, when the baselines it is measured against were deliberately
+		// kept.
 		//
-		// Nothing leaks by keeping them: nextSnapshot exports the experience fields only when
-		// the client is live, and forces them null otherwise, whatever these hold. A genuine
-		// session end still discards them, in the sessionEnded branch of updateSession.
+		// Nothing leaks by keeping them: nextSnapshot exports them only when the client is live
+		// and the player block is complete, and forces them null otherwise, whatever these
+		// hold. A genuine session end still discards them, in the sessionEnded branch of
+		// updateSession.
 	}
 
 	private void markIfChanged(Object current, Object next)

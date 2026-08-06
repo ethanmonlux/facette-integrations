@@ -27,6 +27,9 @@ package com.facette.telemetry;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.Executors;
@@ -40,14 +43,27 @@ import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
 import net.runelite.api.Client;
+import net.runelite.api.EnumComposition;
+import net.runelite.api.EnumID;
+import net.runelite.api.EquipmentInventorySlot;
 import net.runelite.api.GameState;
+import net.runelite.api.Item;
+import net.runelite.api.ItemComposition;
 import net.runelite.api.ItemContainer;
+import net.runelite.api.NPC;
+import net.runelite.api.ParamID;
+import net.runelite.api.Player;
+import net.runelite.api.Prayer;
 import net.runelite.api.Skill;
+import net.runelite.api.StructComposition;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.StatChanged;
 import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.VarPlayerID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.client.RuneLite;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
@@ -64,9 +80,16 @@ import net.runelite.client.plugins.PluginDescriptor;
  * no menu action, and synthesizes no input, so nothing outside the game can act on the game
  * through it.
  *
- * <p>Only the fields listed in {@link TelemetrySnapshot} leave the client. Account identity,
- * credentials, chat, friends and clan data, other players, bank and Grand Exchange contents,
- * wealth, and location are neither read nor exported.
+ * <p>Only the fields listed in {@link TelemetrySnapshot} leave the client, and that list is
+ * closed. Account identity, credentials and tokens, chat, friends and clan data, other players,
+ * bank and Grand Exchange contents, item prices and aggregate wealth, quest and Slayer state,
+ * total or historical account experience, and location are neither read nor exported.
+ *
+ * <p>Two boundaries are enforced at the point of reading rather than left to serialization,
+ * because they are about what the plugin is allowed to <em>look at</em>: the local player is
+ * read for its combat level and its current interaction only, never for its name; and an
+ * interaction is exported only when the other actor is an NPC, so a player target — which would
+ * carry another person's display name — is discarded before it can reach any snapshot.
  */
 @Slf4j
 @PluginDescriptor(
@@ -91,6 +114,48 @@ public class FacetteTelemetryPlugin extends Plugin
 
 	/** Bound on how long an orderly shutdown waits for an in-flight publication. */
 	private static final long SHUTDOWN_TIMEOUT_SECONDS = 5L;
+
+	/**
+	 * The eleven visible equipment slots, in the order {@link TelemetrySnapshot#EQUIPMENT_SLOTS}
+	 * names them.
+	 *
+	 * <p>RuneLite's equipment enumeration also carries the player model's arms, hair, and jaw,
+	 * which never hold an item. They are left out here rather than filtered later, so the only
+	 * slots this plugin can read are the ones the schema declares.
+	 *
+	 * <p>The correspondence with the exported names is positional, and a test pins that the two
+	 * lists agree name for name, so an exported slot label can never drift away from the client
+	 * slot it was read from.
+	 */
+	private static final EquipmentInventorySlot[] EXPORTED_EQUIPMENT_SLOTS = {
+		EquipmentInventorySlot.HEAD,
+		EquipmentInventorySlot.CAPE,
+		EquipmentInventorySlot.AMULET,
+		EquipmentInventorySlot.WEAPON,
+		EquipmentInventorySlot.BODY,
+		EquipmentInventorySlot.SHIELD,
+		EquipmentInventorySlot.LEGS,
+		EquipmentInventorySlot.GLOVES,
+		EquipmentInventorySlot.BOOTS,
+		EquipmentInventorySlot.RING,
+		EquipmentInventorySlot.AMMO,
+	};
+
+	/**
+	 * The combat-mode index the game uses for a staff's casting style, after which a separate
+	 * casting mode selects the defensive entry that follows it.
+	 *
+	 * <p>Not a style label and not a mapping: it is the one index at which the game's own combat
+	 * interface consults a second variable, so the label still comes from the game's data rather
+	 * than from anything written here.
+	 */
+	private static final int STAFF_CASTING_STYLE_INDEX = 4;
+
+	/**
+	 * The style name the game's data uses to mean "this weapon has no style in this position".
+	 * Reported as no reading rather than as a style called "other".
+	 */
+	private static final String NO_ATTACK_STYLE = "other";
 
 	/**
 	 * Package-private rather than private so a same-package test can supply a stand-in without
@@ -449,8 +514,10 @@ public class FacetteTelemetryPlugin extends Plugin
 			return;
 		}
 		// Only the skill and the increase are kept; the total is used as a comparison
-		// baseline and is never exported.
-		state.observeXp(skill.name(), statChanged.getXp());
+		// baseline and is never exported. The enum position travels with the name so the
+		// exported per-skill collection can be ordered deterministically without the state
+		// holding a RuneLite type.
+		state.observeXp(skill.name(), skill.ordinal(), statChanged.getXp());
 	}
 
 	/**
@@ -487,20 +554,292 @@ public class FacetteTelemetryPlugin extends Plugin
 		}
 
 		state.updateWorld(client.getWorld());
+
+		// The local player is read for its combat level and its interaction only. Its name,
+		// account hash, and composition are never touched, and no other player is ever read.
+		Player localPlayer = client.getLocalPlayer();
+		if (localPlayer != null)
+		{
+			state.updateCombatLevel(localPlayer.getCombatLevel());
+		}
+
 		state.updateVitals(
 			client.getBoostedSkillLevel(Skill.HITPOINTS),
 			client.getRealSkillLevel(Skill.HITPOINTS),
 			client.getBoostedSkillLevel(Skill.PRAYER),
 			client.getRealSkillLevel(Skill.PRAYER),
-			client.getEnergy());
+			client.getEnergy(),
+			client.getVarpValue(VarPlayerID.SA_ENERGY),
+			client.getWeight());
 
-		ItemContainer inventory = client.getItemContainer(InventoryID.INV);
-		if (inventory != null)
-		{
-			// Occupied slots, not total item quantity.
-			state.updateInventory(inventory.count());
-		}
+		state.updateCombat(readAttackStyle(), readActivePrayers());
+		state.updateTarget(readNpcTarget(localPlayer));
+		state.updateEquipment(readEquipmentSlots());
+		state.updateInventory(readInventorySlots());
+
+		// Last, and only after every required value has been offered: this is what allows the
+		// session to be reported as carrying valid player data, and it refuses while anything
+		// is still missing.
+		state.markPlayerStateComplete();
 		return true;
+	}
+
+	/**
+	 * The player-readable label for the currently selected attack style, or null when no
+	 * trustworthy reading exists.
+	 *
+	 * <p>The label is the game's own. The client's combat interface selects a style by indexing
+	 * the weapon's style list, and each entry in that list carries its own name as cache data;
+	 * this walks exactly that path — weapon category, style list, style entry, name parameter —
+	 * so nothing here maps a number onto a word.
+	 *
+	 * <p>Every step that can fail yields null rather than a guess. In particular a weapon
+	 * category the game's own style enumeration has no entry for is reported as no reading at
+	 * all: the client falls back to hardcoded style lists for a couple of such weapons, and
+	 * copying those numbers here would be exactly the unverified mapping this avoids.
+	 *
+	 * <p>Called from the client thread only.
+	 */
+	private String readAttackStyle()
+	{
+		int weaponCategory = client.getVarbitValue(VarbitID.COMBAT_WEAPON_CATEGORY);
+		int styleIndex = client.getVarpValue(VarPlayerID.COM_MODE);
+		if (weaponCategory < 0 || styleIndex < 0)
+		{
+			return null;
+		}
+
+		EnumComposition weaponStyles = client.getEnum(EnumID.WEAPON_STYLES);
+		if (weaponStyles == null)
+		{
+			return null;
+		}
+		int styleListId = weaponStyles.getIntValue(weaponCategory);
+		if (styleListId <= 0)
+		{
+			return null;
+		}
+		EnumComposition styleList = client.getEnum(styleListId);
+		if (styleList == null)
+		{
+			return null;
+		}
+		int[] styleStructIds = styleList.getIntVals();
+		if (styleStructIds == null)
+		{
+			return null;
+		}
+
+		if (styleIndex == STAFF_CASTING_STYLE_INDEX)
+		{
+			// Staves use indexes 0..4, with a separate casting mode selecting the defensive
+			// casting entry that follows. Both values come from the client; only the offset
+			// between them is written here.
+			styleIndex += client.getVarbitValue(VarbitID.AUTOCAST_DEFMODE);
+		}
+		if (styleIndex < 0 || styleIndex >= styleStructIds.length)
+		{
+			return null;
+		}
+
+		StructComposition style = client.getStructComposition(styleStructIds[styleIndex]);
+		if (style == null)
+		{
+			return null;
+		}
+		return normalizeAttackStyle(style.getStringValue(ParamID.ATTACK_STYLE_NAME));
+	}
+
+	/**
+	 * Lowercases and trims the game's style name, and reduces a blank one — or the game's own
+	 * "no style here" marker — to no reading at all.
+	 */
+	private static String normalizeAttackStyle(String raw)
+	{
+		if (raw == null)
+		{
+			return null;
+		}
+		String normalized = raw.trim().toLowerCase(Locale.ROOT);
+		if (normalized.isEmpty() || NO_ATTACK_STYLE.equals(normalized))
+		{
+			return null;
+		}
+		return normalized;
+	}
+
+	/**
+	 * The prayers currently active, as lowercase RuneLite prayer names in enum order.
+	 *
+	 * <p>Each prayer is visited exactly once, in the enumeration's own order, so the result is
+	 * deterministic and cannot contain a duplicate. The collection is bounded by the prayer
+	 * enumeration and cannot grow with play time.
+	 *
+	 * <p>Two prayer pairs need more than their own variable to resolve. The upgraded ranged and
+	 * magic prayers share their slot with the prayers they replace, so the variable for the
+	 * older one reads as active when the newer one is in use; which of the pair is really active
+	 * is decided by whether the upgrade is unlocked, and unlocks are suspended inside Last Man
+	 * Standing. Reading the unlock state is what stops both members of a pair being reported as
+	 * active at once.
+	 *
+	 * <p>Called from the client thread only.
+	 */
+	private List<String> readActivePrayers()
+	{
+		boolean inLastManStanding = client.getVarbitValue(VarbitID.BR_INGAME) != 0;
+		boolean deadeyeReplacesEagleEye = !inLastManStanding
+			&& client.getVarbitValue(VarbitID.PRAYER_DEADEYE_UNLOCKED) != 0;
+		boolean vigourReplacesMight = !inLastManStanding
+			&& client.getVarbitValue(VarbitID.PRAYER_MYSTIC_VIGOUR_UNLOCKED) != 0;
+
+		List<String> active = new ArrayList<>();
+		for (Prayer prayer : Prayer.values())
+		{
+			if (prayer == null || client.getVarbitValue(prayer.getVarbit()) == 0)
+			{
+				continue;
+			}
+			if (!isReportableVariant(prayer, deadeyeReplacesEagleEye, vigourReplacesMight))
+			{
+				continue;
+			}
+			active.add(prayer.name().toLowerCase(Locale.ROOT));
+		}
+		return active;
+	}
+
+	/** Whether this member of an upgradable prayer pair is the one actually in use. */
+	private static boolean isReportableVariant(Prayer prayer, boolean deadeyeReplacesEagleEye,
+		boolean vigourReplacesMight)
+	{
+		switch (prayer)
+		{
+			case EAGLE_EYE:
+				return !deadeyeReplacesEagleEye;
+			case DEADEYE:
+				return deadeyeReplacesEagleEye;
+			case MYSTIC_MIGHT:
+				return !vigourReplacesMight;
+			case MYSTIC_VIGOUR:
+				return vigourReplacesMight;
+			default:
+				return true;
+		}
+	}
+
+	/**
+	 * The NPC the local player is interacting with, or null.
+	 *
+	 * <p>The type check is the privacy boundary, not an optimization. A player can be
+	 * interacted with too — followed, traded, attacked — and that actor carries another
+	 * person's display name. Anything that is not an NPC is discarded here and has no path any
+	 * further into the snapshot.
+	 *
+	 * <p>Called from the client thread only.
+	 */
+	private static TelemetryTarget readNpcTarget(Player localPlayer)
+	{
+		if (localPlayer == null)
+		{
+			return null;
+		}
+		Actor interacting = localPlayer.getInteracting();
+		if (!(interacting instanceof NPC))
+		{
+			return null;
+		}
+		NPC npc = (NPC) interacting;
+		// Health is the ratio and scale the server transmits. No real hitpoints figure is asked
+		// for, because the server does not send one.
+		return TelemetryTarget.npc(
+			npc.getId(),
+			npc.getName(),
+			npc.getCombatLevel(),
+			npc.getHealthRatio(),
+			npc.getHealthScale(),
+			npc.isDead());
+	}
+
+	/**
+	 * The eleven visible equipment slots, or null when the client has no equipment container to
+	 * read.
+	 *
+	 * <p>Null means "not read", and the state keeps whatever it last saw rather than reporting
+	 * everything as unequipped. Called from the client thread only.
+	 */
+	private List<TelemetryItemSlot> readEquipmentSlots()
+	{
+		Item[] worn = itemsOf(InventoryID.WORN);
+		if (worn == null)
+		{
+			return null;
+		}
+		List<TelemetryItemSlot> slots = new ArrayList<>(EXPORTED_EQUIPMENT_SLOTS.length);
+		for (EquipmentInventorySlot slot : EXPORTED_EQUIPMENT_SLOTS)
+		{
+			slots.add(readItemSlot(worn, slot.getSlotIdx()));
+		}
+		return slots;
+	}
+
+	/**
+	 * All twenty-eight inventory slots in ascending order, or null when the client has no
+	 * inventory container to read. Called from the client thread only.
+	 */
+	private List<TelemetryItemSlot> readInventorySlots()
+	{
+		Item[] inventory = itemsOf(InventoryID.INV);
+		if (inventory == null)
+		{
+			return null;
+		}
+		List<TelemetryItemSlot> slots = new ArrayList<>(TelemetryState.INVENTORY_CAPACITY);
+		for (int slot = 0; slot < TelemetryState.INVENTORY_CAPACITY; slot++)
+		{
+			slots.add(readItemSlot(inventory, slot));
+		}
+		return slots;
+	}
+
+	private Item[] itemsOf(int containerId)
+	{
+		ItemContainer container = client.getItemContainer(containerId);
+		return container == null ? null : container.getItems();
+	}
+
+	/**
+	 * One slot's contents.
+	 *
+	 * <p>A slot beyond the container's own array is empty rather than an error: container sizes
+	 * are the client's business, and a schema-fixed slot the client does not carry holds nothing
+	 * by definition.
+	 */
+	private TelemetryItemSlot readItemSlot(Item[] items, int slot)
+	{
+		if (slot < 0 || slot >= items.length)
+		{
+			return TelemetryItemSlot.EMPTY;
+		}
+		Item item = items[slot];
+		if (item == null)
+		{
+			return TelemetryItemSlot.EMPTY;
+		}
+		// The identity, the count, and the name. No price, examine text, tradeability, or
+		// aggregate is looked up, and no icon or sprite is touched.
+		return TelemetryItemSlot.of(item.getId(), item.getQuantity(), itemName(item.getId()));
+	}
+
+	private String itemName(int itemId)
+	{
+		ItemComposition composition = client.getItemDefinition(itemId);
+		if (composition == null)
+		{
+			return null;
+		}
+		// The members' name, so the same item reads the same on a free and a members world
+		// instead of gaining a suffix that would look like a change to a reader.
+		return composition.getMembersName();
 	}
 
 	/**
@@ -532,8 +871,9 @@ public class FacetteTelemetryPlugin extends Plugin
 			}
 			// Read per skill rather than through getSkillExperiences(), whose array would have
 			// to be mapped back by ordinal — the kind of positional assumption that breaks
-			// silently when the enum changes.
-			state.seedXpBaseline(skill.name(), client.getSkillExperience(skill));
+			// silently when the enum changes. The ordinal is passed alongside the name only to
+			// order the exported collection, never to look anything up.
+			state.seedXpBaseline(skill.name(), skill.ordinal(), client.getSkillExperience(skill));
 		}
 	}
 
@@ -573,6 +913,13 @@ public class FacetteTelemetryPlugin extends Plugin
 	 * it would not be allowed to commit. This check is an optimization, not the safeguard: a
 	 * run retired after it passes still cannot land on a newer run's file, because the writer
 	 * re-checks commit authority under the lock immediately before replacing the target.
+	 *
+	 * <p>Unchecked failures are contained here rather than allowed to escape. A periodic task
+	 * that throws is cancelled by the executor and never runs again, so an unexpected runtime
+	 * failure on one tick would silently end publication for the rest of the run and leave the
+	 * file reading as live-but-frozen. Swallowing it here means the next tick tries again, and
+	 * the worst case is a stale file with a logged reason rather than a plugin that has quietly
+	 * stopped.
 	 */
 	private void publishTick(PublisherRunContext run)
 	{
@@ -580,11 +927,19 @@ public class FacetteTelemetryPlugin extends Plugin
 		{
 			return;
 		}
-		// No lock is needed for the due-check: the commit decision is made later, inside the
-		// writer. A change landing between here and there only costs a redundant publication.
-		if (run.getState().isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
+		try
 		{
-			publish(run, true);
+			// No lock is needed for the due-check: the commit decision is made later, inside the
+			// writer. A change landing between here and there only costs a redundant publication.
+			if (run.getState().isPublicationDue(HEARTBEAT_INTERVAL_MILLIS))
+			{
+				publish(run, true);
+			}
+		}
+		catch (RuntimeException e)
+		{
+			// Logged without any part of the snapshot payload.
+			log.warn("Telemetry publication tick failed; publication continues", e);
 		}
 	}
 
