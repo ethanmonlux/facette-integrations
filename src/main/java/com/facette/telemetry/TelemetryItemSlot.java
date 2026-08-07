@@ -37,8 +37,15 @@ import java.util.Objects;
  * construction instead of by assertion.
  *
  * <p>Two states, and no third: empty, where all three exported values are null, or occupied,
- * where the identity and quantity are both positive. {@link #of(int, int, String)} is the only
- * way to reach the occupied state and it refuses any reading that would sit between the two.
+ * where the identity is zero or greater and the quantity is positive. {@link #of(int, int,
+ * String)} is the only way to reach the occupied state and it refuses any reading that would sit
+ * between the two.
+ *
+ * <p>Zero is a real item identity, not an absence. The client's own signal for an empty slot is a
+ * <em>negative</em> identity, and item {@code 0} exists in the game's item enumeration, so a slot
+ * holding it is occupied like any other. That distinction lives here and nowhere else: a reader
+ * decides occupancy from whether the exported values are null, never from whether the identity is
+ * above zero.
  *
  * <p>Nothing here is priced, valued, or aggregated. No price, tradeability, examine text,
  * Grand Exchange data, bank ownership, wealth total, sprite, or artwork is held or derivable.
@@ -73,7 +80,10 @@ final class TelemetryItemSlot
 	/**
 	 * The slot as read from the client.
 	 *
-	 * @param itemId   the item identity; a non-positive value is not an item
+	 * @param itemId   the item identity; only a <em>negative</em> value is not an item. Zero is a
+	 *                 real identity in the game's item enumeration, and the client signals an
+	 *                 empty slot with a negative one, so treating zero as absent would report a
+	 *                 held item as an empty slot and undercount occupancy
 	 * @param quantity the stack size; a non-positive value is not an item. Stack size does not
 	 *                 affect whether the slot counts as occupied — one slot holding a million
 	 *                 coins is one occupied slot
@@ -82,7 +92,7 @@ final class TelemetryItemSlot
 	 */
 	static TelemetryItemSlot of(int itemId, int quantity, String name)
 	{
-		if (itemId <= 0 || quantity <= 0)
+		if (itemId < 0 || quantity <= 0)
 		{
 			return EMPTY;
 		}

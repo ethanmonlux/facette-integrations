@@ -146,10 +146,16 @@ Every equipment and inventory entry has the same four fields, in this order:
 | `quantity` | integer or null | The stack size. A stack of a million coins is still **one** occupied slot. |
 | `name` | string or null | The item's name as the game reports it. |
 
-An **empty** slot has `itemId`, `quantity`, and `name` all `null`. An **occupied** slot has a
-positive `itemId` and a positive `quantity`. There is nothing in between. (`name` is `null` in the
-one degenerate case where the client has no name for an item it is holding; inventing one would be
-worse than saying so.)
+An **empty** slot has `itemId`, `quantity`, and `name` all `null`. An **occupied** slot has an
+`itemId` of `0` or greater and a positive `quantity`. There is nothing in between. (`name` is
+`null` in the one degenerate case where the client has no name for an item it is holding;
+inventing one would be worse than saying so.)
+
+> **Reading occupancy:** decide from nullability — `itemId !== null` — and never from
+> `itemId > 0`. Item identity `0` is a real item in the game's own item enumeration, so a slot
+> holding it is occupied and counts towards `usedSlots`. The game client signals an empty slot
+> with a *negative* identity internally; that negative value never appears in this file, because
+> an empty slot is always exported as the three nulls above.
 
 **Item IDs, names, and quantities are exported. Prices are not, and neither is aggregate wealth.**
 No price, high-alchemy value, Grand Exchange data, tradeability, examine text, bank content, total

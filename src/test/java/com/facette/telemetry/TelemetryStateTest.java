@@ -626,6 +626,35 @@ public class TelemetryStateTest
 		}
 	}
 
+	/**
+	 * Item identity zero is a real item, so a slot holding one is occupied and must be counted.
+	 * Treating zero as absent undercounted {@code usedSlots} and overcounted {@code freeSlots}.
+	 */
+	@Test
+	public void anItemOfIdentityZeroCountsTowardsOccupancy()
+	{
+		logIn();
+		List<TelemetryItemSlot> slots = new ArrayList<>(emptyInventory());
+		slots.set(0, TelemetryItemSlot.of(0, 1, "Sample remains"));
+		slots.set(1, TelemetryItemSlot.of(2001, 1, "Sample pickaxe"));
+		assertTrue(state.updateInventory(slots));
+
+		String json = snapshot();
+		assertEquals("both slots are occupied", "2", value(json, "usedSlots"));
+		assertEquals("26", value(json, "freeSlots"));
+		assertTrue(json, json.contains(
+			"{\"slot\":0,\"itemId\":0,\"quantity\":1,\"name\":\"Sample remains\"}"));
+
+		// The negative identity beside it is still the empty representation.
+		slots.set(1, TelemetryItemSlot.of(-1, 0, "ignored"));
+		assertTrue(state.updateInventory(slots));
+		json = snapshot();
+		assertEquals("1", value(json, "usedSlots"));
+		assertEquals("27", value(json, "freeSlots"));
+		assertTrue(json, json.contains(
+			"{\"slot\":1,\"itemId\":null,\"quantity\":null,\"name\":null}"));
+	}
+
 	@Test
 	public void aStackDoesNotChangeOccupiedSlotCounting()
 	{

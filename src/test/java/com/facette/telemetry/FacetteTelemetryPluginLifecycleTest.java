@@ -820,6 +820,40 @@ public class FacetteTelemetryPluginLifecycleTest
 	}
 
 	/**
+	 * End to end, through a real client reading: an item of identity zero is a held item, and the
+	 * client's own empty signal is a negative identity. Reading zero as absent reported a carried
+	 * item as an empty slot and undercounted occupancy.
+	 */
+	@Test
+	public void anItemOfIdentityZeroIsSampledAsHeldRatherThanAsAnEmptySlot() throws IOException
+	{
+		logInClient();
+		inventoryItems[0] = new Item(0, 1);
+		inventoryItems[1] = new Item(2001, 3);
+		// Left at the client's empty sentinel, as every other slot already is.
+		inventoryItems[2] = new Item(-1, 0);
+		wornItems[3] = new Item(0, 1);
+
+		plugin.startUp();
+		runClientThreadQueue();
+		onlyExecutor().runScheduledTaskOnce();
+
+		String json = snapshotOnDisk();
+		assertEquals("both held items are counted", "2", value(json, "usedSlots"));
+		assertEquals("26", value(json, "freeSlots"));
+		assertTrue(json, json.contains(
+			"{\"slot\":0,\"itemId\":0,\"quantity\":1,\"name\":\"Sample item\"}"));
+		assertTrue(json, json.contains(
+			"{\"slot\":1,\"itemId\":2001,\"quantity\":3,\"name\":\"Sample item\"}"));
+		assertTrue("the negative sentinel is still an empty slot", json.contains(
+			"{\"slot\":2,\"itemId\":null,\"quantity\":null,\"name\":null}"));
+		assertTrue("and equipment behaves identically", json.contains(
+			"{\"slot\":\"weapon\",\"itemId\":0,\"quantity\":1,\"name\":\"Sample item\"}"));
+
+		plugin.shutDown();
+	}
+
+	/**
 	 * The three RuneLite equipment slots that only exist on the player model — arms, hair, and
 	 * jaw — must not appear, and each exported slot must read from the client slot the schema
 	 * names.

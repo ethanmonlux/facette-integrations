@@ -753,10 +753,104 @@ public class TelemetrySnapshotTest
 		assertEquals("Sample whip", occupied.getName());
 
 		// Nothing between the two states is reachable.
-		assertEquals(TelemetryItemSlot.EMPTY, TelemetryItemSlot.of(0, 5, "Sample"));
 		assertEquals(TelemetryItemSlot.EMPTY, TelemetryItemSlot.of(-1, 0, "Sample"));
 		assertEquals(TelemetryItemSlot.EMPTY, TelemetryItemSlot.of(4151, 0, "Sample"));
 		assertEquals(TelemetryItemSlot.EMPTY, TelemetryItemSlot.of(4151, -3, "Sample"));
+	}
+
+	/**
+	 * Item identity zero is a real item, not an absence.
+	 *
+	 * <p>The client signals an empty slot with a <em>negative</em> identity, and zero is a genuine
+	 * entry in the game's item enumeration. Treating it as absent reported a held item as an empty
+	 * slot and silently undercounted occupancy.
+	 */
+	@Test
+	public void itemIdentityZeroIsOccupiedRatherThanEmpty()
+	{
+		TelemetryItemSlot zero = TelemetryItemSlot.of(0, 1, "Sample remains");
+		assertTrue("identity zero is an item", zero.isOccupied());
+		assertEquals(Integer.valueOf(0), zero.getItemId());
+		assertEquals(Integer.valueOf(1), zero.getQuantity());
+		assertEquals("Sample remains", zero.getName());
+	}
+
+	@Test
+	public void onlyANegativeIdentityNormalizesToTheEmptySlotRepresentation()
+	{
+		for (int absent : new int[]{-1, -2, Integer.MIN_VALUE})
+		{
+			TelemetryItemSlot slot = TelemetryItemSlot.of(absent, 1, "Sample");
+			assertEquals("identity " + absent + " is the client's empty signal",
+				TelemetryItemSlot.EMPTY, slot);
+			assertFalse(slot.isOccupied());
+			assertEquals(null, slot.getItemId());
+			assertEquals(null, slot.getQuantity());
+			assertEquals(null, slot.getName());
+		}
+	}
+
+	@Test
+	public void ordinaryPositiveIdentitiesAreUnaffectedByTheZeroRule()
+	{
+		for (int id : new int[]{1, 995, 4151, Integer.MAX_VALUE})
+		{
+			TelemetryItemSlot slot = TelemetryItemSlot.of(id, 2, "Sample");
+			assertTrue(slot.isOccupied());
+			assertEquals(Integer.valueOf(id), slot.getItemId());
+			assertEquals(Integer.valueOf(2), slot.getQuantity());
+		}
+	}
+
+	/** Identity zero has to survive serialization as a number, not become a null. */
+	@Test
+	public void itemIdentityZeroSerializesAsAnOccupiedSlot()
+	{
+		List<TelemetryItemSlot> inventory = new ArrayList<>();
+		inventory.add(TelemetryItemSlot.of(0, 1, "Sample remains"));
+		while (inventory.size() < TelemetrySnapshot.INVENTORY_SLOTS)
+		{
+			inventory.add(TelemetryItemSlot.EMPTY);
+		}
+		List<TelemetryItemSlot> equipment = new ArrayList<>();
+		equipment.add(TelemetryItemSlot.of(0, 1, "Sample remains"));
+		while (equipment.size() < TelemetrySnapshot.EQUIPMENT_SLOTS.size())
+		{
+			equipment.add(TelemetryItemSlot.EMPTY);
+		}
+
+		String json = TelemetrySnapshot.builder()
+			.instanceId(INSTANCE_ID)
+			.seq(0L)
+			.emittedAt(EMITTED_AT)
+			.pluginActive(true)
+			.gameState("LOGGED_IN")
+			.loggedIn(true)
+			.equipmentSlots(equipment)
+			.inventory(1, 27, inventory)
+			.build()
+			.toJson();
+
+		assertTrue(json, json.contains(
+			"{\"slot\":0,\"itemId\":0,\"quantity\":1,\"name\":\"Sample remains\"}"));
+		assertTrue(json, json.contains(
+			"{\"slot\":\"head\",\"itemId\":0,\"quantity\":1,\"name\":\"Sample remains\"}"));
+		assertEquals("and it counts towards occupancy", "1", valueOf(json, "usedSlots"));
+		assertEquals("27", valueOf(json, "freeSlots"));
+	}
+
+	/** Minimal scalar reader; the whole-document assertions above are the primary pin. */
+	private static String valueOf(String json, String key)
+	{
+		int at = json.indexOf("\"" + key + "\":");
+		assertTrue("missing key " + key, at >= 0);
+		int start = at + key.length() + 3;
+		int end = start;
+		while (end < json.length() && json.charAt(end) != ',' && json.charAt(end) != '}')
+		{
+			end++;
+		}
+		return json.substring(start, end);
 	}
 
 	@Test
