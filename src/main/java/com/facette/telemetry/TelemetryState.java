@@ -164,10 +164,16 @@ final class TelemetryState
 			this.order = order;
 		}
 
-		private void add(int delta, long atMillis)
+		/**
+		 * @param earned      how much to add to the cumulative session total
+		 * @param latestGain  the size of the most recent single gain, which is the same as
+		 *                    {@code earned} for a live observation but smaller when a startup
+		 *                    window contributed several gains at once
+		 */
+		private void add(int earned, int latestGain, long atMillis)
 		{
-			gained += delta;
-			lastDelta = delta;
+			gained += earned;
+			lastDelta = latestGain;
 			lastChangedAt = atMillis;
 		}
 
@@ -201,6 +207,18 @@ final class TelemetryState
 		private int latestTotal;
 
 		/**
+		 * Total immediately before {@link #latestTotal}, so the size of the most recent single
+		 * increase stays recoverable.
+		 *
+		 * <p>The span's endpoints alone cannot answer "how big was the last gain". Three
+		 * increasing totals — 100, 110, 115 — bound a span of 15, but the player's most recent
+		 * gain was 5. Exporting 15 as the latest gain would overstate a single event by the size
+		 * of everything that preceded it in the window, which is why the near endpoint is kept
+		 * alongside the far one.
+		 */
+		private int previousTotal;
+
+		/**
 		 * Wall-clock time of the observation that last advanced {@link #latestTotal}. Exported
 		 * as {@code lastChangedAt}, and used for nothing else — deciding which span is most
 		 * recent is {@link #latestEventOrder}'s job.
@@ -217,6 +235,7 @@ final class TelemetryState
 		{
 			this.earliestTotal = total;
 			this.latestTotal = total;
+			this.previousTotal = total;
 			this.latestEventAtMillis = atMillis;
 			this.latestEventOrder = order;
 		}
@@ -234,6 +253,7 @@ final class TelemetryState
 			{
 				return;
 			}
+			previousTotal = latestTotal;
 			latestTotal = total;
 			latestEventAtMillis = atMillis;
 			latestEventOrder = order;
@@ -243,6 +263,21 @@ final class TelemetryState
 		private boolean hasMeasurableSpan()
 		{
 			return latestTotal > earliestTotal;
+		}
+
+		/** The whole measurable span: everything this window can account for. */
+		private int span()
+		{
+			return latestTotal - earliestTotal;
+		}
+
+		/**
+		 * The most recent single increase, which for a window of exactly one measurable gain is
+		 * the same as {@link #span()} and for a longer window is smaller.
+		 */
+		private int lastIncrement()
+		{
+			return latestTotal - previousTotal;
 		}
 	}
 
@@ -715,10 +750,16 @@ final class TelemetryState
 		// this seed has no event of its own, and stretching the delta to cover it would mean
 		// stamping that portion with a time no event happened at. The baseline already sits at
 		// the live total, so nothing measured here is counted twice later.
-		int span = retained.latestTotal - retained.earliestTotal;
+		// Two different quantities, and conflating them overstates a single event. The span is
+		// everything this window accounts for and belongs to the skill's cumulative total; the
+		// last increment is the size of one gain and is what a "latest gain" field means. They
+		// coincide when the window held exactly one measurable gain, and diverge when it held
+		// more.
+		int span = retained.span();
+		int lastIncrement = retained.lastIncrement();
 		// The skill's own session total always takes the span: it is that skill's gain whether
 		// or not it is also the most recent gain in the session.
-		accumulateSessionGain(skill, skillOrder, span, retained.latestEventAtMillis);
+		accumulateSessionGain(skill, skillOrder, span, lastIncrement, retained.latestEventAtMillis);
 
 		// The latest-gain triple, by contrast, describes one gain and can hold only the newest.
 		// Seeding walks every skill in enum order, so several skills can have measurable spans
@@ -737,7 +778,9 @@ final class TelemetryState
 		}
 
 		lastSkill = skill;
-		lastDelta = span;
+		// The last increment, not the span, for the same reason: this field describes one gain.
+		// The span is not lost — it is in the skill's cumulative session total above.
+		lastDelta = lastIncrement;
 		lastChangedAt = retained.latestEventAtMillis;
 		lastReportedXpOrder = retained.latestEventOrder;
 		markDirty();
@@ -914,7 +957,9 @@ final class TelemetryState
 
 		int delta = totalXp - previous;
 		long atMillis = wallClockMillis.getAsLong();
-		accumulateSessionGain(skill, skillOrder, delta, atMillis);
+		// A live observation is one gain, so what it adds and its size as an event are the same
+		// number. Only the deferred-startup window can make those differ.
+		accumulateSessionGain(skill, skillOrder, delta, delta, atMillis);
 
 		lastSkill = skill;
 		lastDelta = delta;
@@ -936,9 +981,10 @@ final class TelemetryState
 	 * is always updated, so a bound that has been reached cannot stop a real skill's total from
 	 * continuing to advance.
 	 */
-	private void accumulateSessionGain(String skill, int skillOrder, int delta, long atMillis)
+	private void accumulateSessionGain(String skill, int skillOrder, int earned, int latestGain,
+		long atMillis)
 	{
-		if (delta <= 0 || OVERALL_SKILL_NAME.equals(skill))
+		if (earned <= 0 || latestGain <= 0 || OVERALL_SKILL_NAME.equals(skill))
 		{
 			return;
 		}
@@ -952,7 +998,7 @@ final class TelemetryState
 			gain = new TrackedSkillGain(skill, skillOrder);
 			sessionXpGains.put(skill, gain);
 		}
-		gain.add(delta, atMillis);
+		gain.add(earned, latestGain, atMillis);
 		markDirty();
 	}
 

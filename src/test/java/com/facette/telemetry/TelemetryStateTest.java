@@ -1203,7 +1203,7 @@ public class TelemetryStateTest
 	 * distinguishable failures rather than coincidentally equal to the right answer.
 	 */
 	@Test
-	public void threeRetainedEventsAggregateTheSpanAndUseTheLatestEventTime()
+	public void threeRetainedEventsTotalTheSpanButReportOnlyTheLastGainAsTheLatest()
 	{
 		now = 1_770_000_001_000L;
 		state.recordPreInitialXp("THIEVING", 1_046);
@@ -1217,9 +1217,61 @@ public class TelemetryStateTest
 		assertTrue(state.seedXpBaseline("THIEVING", THIEVING, 1_150));
 
 		String json = snapshot();
-		assertEquals("the whole measurable span, 1150 - 1046", "104", value(json, "lastDelta"));
+		assertEquals("the last single gain, 1150 - 1092 — not the whole span", "58",
+			value(json, "lastDelta"));
 		assertEquals("the third event's time, not the first and not the seed", "1770000003000",
 			value(json, "lastChangedAt"));
+		assertEquals("but the cumulative total still accounts for the whole span, 1150 - 1046",
+			"[{\"skill\":\"thieving\",\"gained\":104,\"lastDelta\":58,"
+				+ "\"lastChangedAt\":1770000003000}]", value(json, "skills"));
+	}
+
+	/**
+	 * The boundary between the two quantities: a window holding exactly one measurable gain has a
+	 * span equal to its last increment, so separating them must not perturb that case.
+	 */
+	@Test
+	public void aWindowWithOneMeasurableGainReportsTheSameValueForBoth()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("MINING", 5_000);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("MINING", 5_060);
+
+		logIn();
+		assertTrue(state.seedXpBaseline("MINING", MINING, 5_060));
+
+		String json = snapshot();
+		assertEquals("60", value(json, "lastDelta"));
+		assertEquals("[{\"skill\":\"mining\",\"gained\":60,\"lastDelta\":60,"
+			+ "\"lastChangedAt\":1770000002000}]", value(json, "skills"));
+	}
+
+	/**
+	 * A live gain following a multi-event startup window takes over the latest-gain fields with
+	 * its own size, while the cumulative total keeps accruing across both.
+	 */
+	@Test
+	public void aLiveGainAfterAMultiEventWindowOwnsTheLatestGainFields()
+	{
+		now = 1_770_000_001_000L;
+		state.recordPreInitialXp("THIEVING", 100);
+		now = 1_770_000_002_000L;
+		state.recordPreInitialXp("THIEVING", 110);
+		now = 1_770_000_003_000L;
+		state.recordPreInitialXp("THIEVING", 115);
+
+		logIn();
+		assertTrue(state.seedXpBaseline("THIEVING", THIEVING, 115));
+		assertEquals("the last increment, 115 - 110", "5", value(snapshot(), "lastDelta"));
+
+		now = 1_770_000_010_000L;
+		assertTrue(state.observeXp("THIEVING", THIEVING, 142));
+
+		String json = snapshot();
+		assertEquals("27", value(json, "lastDelta"));
+		assertEquals("[{\"skill\":\"thieving\",\"gained\":42,\"lastDelta\":27,"
+			+ "\"lastChangedAt\":1770000010000}]", value(json, "skills"));
 	}
 
 	/**
@@ -1370,8 +1422,11 @@ public class TelemetryStateTest
 		now = 1_770_000_020_000L;
 		assertTrue(state.seedXpBaseline("FISHING", FISHING, 300));
 		String json = snapshot();
-		assertEquals("200", value(json, "lastDelta"));
+		assertEquals("the last single gain, 300 - 200", "100", value(json, "lastDelta"));
 		assertEquals("1770000003000", value(json, "lastChangedAt"));
+		assertEquals("while the cumulative total spans 100..300",
+			"[{\"skill\":\"fishing\",\"gained\":200,\"lastDelta\":100,"
+				+ "\"lastChangedAt\":1770000003000}]", value(json, "skills"));
 	}
 
 	/**
